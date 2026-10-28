@@ -31,13 +31,13 @@ export interface DoorStateMachineOptions {
   midTravelBehaviour: MidTravelBehaviour;
 }
 
+/**
+ * Events emitted by the state machine, as a map of event name to argument
+ * tuple. Passed to EventEmitter's type parameter so `on` and `emit` are
+ * checked without resorting to declaration merging.
+ */
 export interface DoorStateMachineEvents {
   stateChange: [event: DoorStateChangeEvent];
-}
-
-export declare interface DoorStateMachine {
-  on<K extends keyof DoorStateMachineEvents>(event: K, listener: (...args: DoorStateMachineEvents[K]) => void): this;
-  emit<K extends keyof DoorStateMachineEvents>(event: K, ...args: DoorStateMachineEvents[K]): boolean;
 }
 
 /**
@@ -47,7 +47,7 @@ export declare interface DoorStateMachine {
  * actions that the caller (accessory handler) should execute, and accepts
  * notifications about pulse outcomes and external state changes.
  */
-export class DoorStateMachine extends EventEmitter {
+export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
   private _state: DoorState = 'CLOSED';
   private _travelTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly openingTime: number;
