@@ -1,8 +1,17 @@
 {
   "name": "homebridge-itach-garage-door",
   "version": "1.0.0",
-  "description": "Homebridge plugin for garage door control via Global Caché iTach IP2CC relay",
+  "description": "Homebridge plugin for garage door and gate control via Global Caché iTach IP2CC relay",
   "license": "MIT",
+  "author": "rdawson6",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rdawson6/homebridge-itach-garage-door.git"
+  },
+  "homepage": "https://github.com/rdawson6/homebridge-itach-garage-door#readme",
+  "bugs": {
+    "url": "https://github.com/rdawson6/homebridge-itach-garage-door/issues"
+  },
   "type": "commonjs",
   "main": "dist/index.js",
   "scripts": {

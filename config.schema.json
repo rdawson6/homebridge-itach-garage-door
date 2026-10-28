@@ -3,7 +3,7 @@
   "pluginType": "platform",
   "singular": true,
   "headerDisplay": "iTach IP2CC Garage Door Opener. Controls garage doors through Global Caché iTach IP2CC contact-closure relays over TCP. Door position is inferred from travel timers and can optionally be corrected by an authenticated HTTP webhook.",
-  "footerDisplay": "Wire the relay across your opener's wall-button terminals. See the [README](https://github.com/richdawson/homebridge-itach-garage-door#readme) for wiring, webhook setup, and safety notes.",
+  "footerDisplay": "Wire the relay across your opener's wall-button terminals. See the [README](https://github.com/rdawson6/homebridge-itach-garage-door#readme) for wiring, webhook setup, and safety notes.",
   "schema": {
     "type": "object",
     "properties": {
