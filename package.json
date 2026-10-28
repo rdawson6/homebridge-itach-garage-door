@@ -1,0 +1,45 @@
+{
+  "name": "homebridge-itach-garage-door",
+  "version": "1.0.0",
+  "description": "Homebridge plugin for garage door control via Global Caché iTach IP2CC relay",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "lint": "eslint src/ --ext .ts",
+    "test": "vitest run --config vitest.config.mts",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "homekit",
+    "garage-door",
+    "itach",
+    "ip2cc",
+    "global-cache"
+  ],
+  "engines": {
+    "node": ">=20.0.0",
+    "homebridge": "^1.8.0 || ^2.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "@typescript-eslint/eslint-plugin": "^7.16.1",
+    "@typescript-eslint/parser": "^7.16.1",
+    "eslint": "^8.57.0",
+    "fast-check": "^3.19.0",
+    "homebridge": "^1.8.4",
+    "typescript": "^5.4.5",
+    "vitest": "^2.0.5"
+  },
+  "files": [
+    "dist/",
+    "config.schema.json",
+    "README.md",
+    "CHANGELOG.md"
+  ]
+}
