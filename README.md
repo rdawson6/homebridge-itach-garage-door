@@ -256,6 +256,16 @@ Read this section before putting the plugin into service.
 - **Token disclosure.** Anyone holding the webhook token can change the reported state and cause automations to behave incorrectly. Keep the token secret, prefer binding to `127.0.0.1` or a trusted LAN, and never expose the webhook port directly to the internet. The plugin never writes the token to its logs.
 - **Relay release failure.** If the relay were to stay closed, the opener would see a continuously held button. The plugin retries the release and then locks the door out rather than leaving that state unattended, but check the installation if you see lockout errors.
 
+## Credits
+
+**Global Caché Unified TCP/IP API**
+Documented by [Global Caché](https://www.globalcache.com) in the iTach API specification.
+
+**Built with Kiro AI**
+This plugin was designed and built with [Kiro](https://kiro.dev), an AI-powered development environment. Kiro wrote the code and tests, and verified the protocol, pulse timing, multi-relay operation and webhook against a real iTach IP2CC before release.
+
+---
+
 ## Licence
 
 MIT

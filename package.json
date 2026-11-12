@@ -1,6 +1,6 @@
 {
   "name": "homebridge-itach-garage-door",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "displayName": "iTach IP2CC Garage Door & Gates",
   "description": "Homebridge plugin that controls garage doors and gates through a Global Caché iTach IP2CC contact-closure relay over TCP. Drives a momentary pulse like a wall button, infers door position from configurable travel timers, and accepts authenticated webhook updates so an external sensor can correct the reported state.",
   "license": "MIT",
