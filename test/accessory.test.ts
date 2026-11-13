@@ -269,6 +269,12 @@ describe('GarageDoorAccessory', () => {
       sm.setExternalState('OPENING');
       expect(acc.handleCurrentDoorStateGet()).toBe(2); // OPENING
     });
+
+    it('returns STOPPED for a stop-mode door stopped mid-travel', () => {
+      const acc = build();
+      sm.setExternalState('STOPPED');
+      expect(acc.handleCurrentDoorStateGet()).toBe(4); // STOPPED
+    });
   });
 
   // ─── State-machine reflection ──────────────────────────────────────────────
@@ -525,6 +531,31 @@ describe('GarageDoorAccessory — one-push door', () => {
     expect(sm.state).toBe('OPENING');
     const warnings = (log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
     expect(warnings.some((m) => m.includes('no record of the last travel direction'))).toBe(true);
+  });
+
+  it('reads back the held travel direction while internally STOPPED', async () => {
+    const acc = build();
+    await acc.handleTargetDoorStateSet(0); // open
+    await acc.handleTargetDoorStateSet(1); // interrupt → STOPPED (was opening)
+
+    expect(sm.state).toBe('STOPPED');
+    expect(acc.handleCurrentDoorStateGet()).toBe(2); // OPENING, not STOPPED
+
+    sm.setExternalState('OPEN');
+    await acc.handleTargetDoorStateSet(1); // close
+    await acc.handleTargetDoorStateSet(0); // interrupt → STOPPED (was closing)
+
+    expect(sm.state).toBe('STOPPED');
+    expect(acc.handleCurrentDoorStateGet()).toBe(3); // CLOSING, not STOPPED
+  });
+
+  it('reads back OPEN while internally STOPPED with an unknown direction', () => {
+    sm.restoreState({ '192.168.4.235:1:1': 'CLOSING' }, '192.168.4.235:1:1');
+    const acc = build();
+
+    expect(sm.state).toBe('STOPPED');
+    expect(sm.lastTravelDirection).toBeNull();
+    expect(acc.handleCurrentDoorStateGet()).toBe(0); // OPEN, not STOPPED
   });
 
   it('throws HapStatusError on pulse failure and leaves state and memory untouched', async () => {

@@ -237,7 +237,16 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
   }
 
   handleCurrentDoorStateGet(): CharacteristicValue {
-    return toCurrentDoorState(this.stateMachine.state);
+    // Reads go through the same presentation layer as pushed updates: a HomeKit
+    // read overwrites the stored characteristic value, so skipping the mapping
+    // here would put STOPPED (4) back on a one-push door's tile.
+    return toCurrentDoorState(
+      presentDoorState(
+        this.stateMachine.state,
+        this.config.midTravelBehaviour,
+        this.stateMachine.lastTravelDirection,
+      ),
+    );
   }
 
   handleObstructionDetectedGet(): boolean {
