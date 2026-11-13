@@ -16,7 +16,13 @@ import type {
   PlatformAccessoryLike,
   ServiceLike,
 } from './hap-types.js';
-import type { DoorState, DoorStateChangeEvent, ValidatedDoorEntry } from './types.js';
+import type {
+  DoorState,
+  DoorStateChangeEvent,
+  MidTravelBehaviour,
+  TravelDirection,
+  ValidatedDoorEntry,
+} from './types.js';
 import type { DoorStateMachine } from './door-state-machine.js';
 import type { PulseActuator } from './pulse-actuator.js';
 import type { WebhookDoorHandler } from './webhook-listener.js';
@@ -46,6 +52,41 @@ export function toTargetDoorState(state: DoorState): number {
     case 'STOPPED':
       return 1; // CLOSED
   }
+}
+
+/**
+ * Presentation choice for a one-push door that is internally STOPPED.
+ *
+ * 'HOLD_TRAVEL' — keep showing OPENING/CLOSING (the owner's stated preference).
+ * 'OPEN'        — settle the tile on OPEN.
+ *
+ * This single constant is the whole switch: set it to 'OPEN' to change the
+ * behaviour. Nothing else in the plugin needs to change, and no config option
+ * is exposed for it.
+ */
+const ONE_PUSH_STOPPED_PRESENTATION: 'HOLD_TRAVEL' | 'OPEN' = 'HOLD_TRAVEL';
+
+/**
+ * Map the internal door state to the state HomeKit is shown. Pure and total.
+ *
+ * Identity for every state on a 'stop' or 'reverse' door, and for every state
+ * other than STOPPED. A one-push door interrupted mid-travel is never shown as
+ * STOPPED: it holds the travel direction it was last moving in, or settles on
+ * OPEN when that direction is unknown (after a restart, for example) rather
+ * than inventing one.
+ */
+export function presentDoorState(
+  state: DoorState,
+  midTravelBehaviour: MidTravelBehaviour,
+  lastDirection: TravelDirection | null,
+): DoorState {
+  if (state !== 'STOPPED' || midTravelBehaviour !== 'one-push') {
+    return state;
+  }
+  if (ONE_PUSH_STOPPED_PRESENTATION === 'OPEN') {
+    return 'OPEN';
+  }
+  return lastDirection ?? 'OPEN';
 }
 
 export class GarageDoorAccessory implements WebhookDoorHandler {
@@ -149,7 +190,36 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
       return;
     }
 
+    if (action === 'unachievable') {
+      // One-push opener stopped mid-travel: the next press goes the other way,
+      // and one press per request means there is nothing safe to actuate.
+      const lastDirection = this.stateMachine.lastTravelDirection;
+      const nextPress = lastDirection === 'OPENING' ? 'close' : 'open';
+      this.log.warn(
+        `Door "${this.config.name}" ignored a ${wantsOpen ? 'open' : 'close'} request: the door is ` +
+        `stopped mid-travel (was ${String(lastDirection)}) and this single-button opener's next press ` +
+        `will ${nextPress} it. One press per request, so nothing was actuated; press again to ${nextPress}.`,
+      );
+      // Re-assert the real situation so the Home app settles rather than
+      // showing a target that never arrives.
+      this.pushCharacteristics(this.stateMachine.state);
+      return;
+    }
+
     const target: 'OPEN' | 'CLOSED' = wantsOpen ? 'OPEN' : 'CLOSED';
+
+    if (
+      this.config.midTravelBehaviour === 'one-push' &&
+      this.stateMachine.state === 'STOPPED' &&
+      this.stateMachine.lastTravelDirection === null
+    ) {
+      this.log.warn(
+        `Door "${this.config.name}" is stopped mid-travel with no record of the last travel ` +
+        'direction (the direction is not persisted across restarts), so the direction of the next ' +
+        `press cannot be known. Assuming this press ${wantsOpen ? 'opens' : 'closes'} the door; the ` +
+        'reported state may be inverted until a full travel leg completes or a webhook corrects it.',
+      );
+    }
 
     try {
       await this.actuator.actuate(target);
@@ -192,10 +262,15 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
 
   private pushCharacteristics(state: DoorState): void {
     const { Characteristic } = this.api.hap;
-    this.service.updateCharacteristic(Characteristic.CurrentDoorState, toCurrentDoorState(state));
-    // STOPPED leaves TargetDoorState unchanged (Requirement 8.7).
-    if (state !== 'STOPPED') {
-      this.service.updateCharacteristic(Characteristic.TargetDoorState, toTargetDoorState(state));
+    const shown = presentDoorState(
+      state,
+      this.config.midTravelBehaviour,
+      this.stateMachine.lastTravelDirection,
+    );
+    this.service.updateCharacteristic(Characteristic.CurrentDoorState, toCurrentDoorState(shown));
+    // A presented STOPPED leaves TargetDoorState unchanged (Requirement 8.7).
+    if (shown !== 'STOPPED') {
+      this.service.updateCharacteristic(Characteristic.TargetDoorState, toTargetDoorState(shown));
     }
   }
 

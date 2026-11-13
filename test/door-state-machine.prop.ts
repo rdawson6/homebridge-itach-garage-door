@@ -8,8 +8,9 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fc from 'fast-check';
-import { DoorStateMachine } from '../src/door-state-machine.js';
-import type { DoorState, MidTravelBehaviour } from '../src/types.js';
+import { DoorStateMachine, nextOnePushOutcome } from '../src/door-state-machine.js';
+import { presentDoorState, toCurrentDoorState, toTargetDoorState } from '../src/accessory.js';
+import type { DoorState, MidTravelBehaviour, TravelDirection } from '../src/types.js';
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -22,31 +23,16 @@ afterEach(() => {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const doorStateArb: fc.Arbitrary<DoorState> = fc.constantFrom('CLOSED', 'OPEN', 'OPENING', 'CLOSING', 'STOPPED');
-const midTravelArb: fc.Arbitrary<MidTravelBehaviour> = fc.constantFrom('stop', 'reverse');
+const midTravelArb: fc.Arbitrary<MidTravelBehaviour> = fc.constantFrom('stop', 'reverse', 'one-push');
+const travelDirectionArb: fc.Arbitrary<TravelDirection | null> = fc.constantFrom('OPENING', 'CLOSING', null);
 
-/** HomeKit CurrentDoorState mapping. */
-function currentDoorStateValue(state: DoorState): number {
-  switch (state) {
-    case 'CLOSED': return 0;
-    case 'OPEN': return 1;
-    case 'OPENING': return 2;
-    case 'CLOSING': return 3;
-    case 'STOPPED': return 4;
-  }
-}
-
-/** HomeKit TargetDoorState mapping. */
-function targetDoorStateValue(state: DoorState): number {
-  switch (state) {
-    case 'OPEN':
-    case 'OPENING':
-      return 0; // OPEN
-    case 'CLOSED':
-    case 'CLOSING':
-    case 'STOPPED':
-      return 1; // CLOSED
-  }
-}
+/**
+ * HomeKit CurrentDoorState and TargetDoorState mappings. These bind to the
+ * functions the plugin actually ships, so the properties below prove something
+ * about production code rather than about a copy kept in this file.
+ */
+const currentDoorStateValue = toCurrentDoorState;
+const targetDoorStateValue = toTargetDoorState;
 
 // ─── Command type for model-based testing ────────────────────────────────────
 
@@ -208,6 +194,127 @@ describe('Property 4: State Machine Transition Correctness (Model-Based)', () =>
       { numRuns: 50 },
     );
   });
+
+  it('direction memory is set while travelling and cleared at a terminal position', () => {
+    fc.assert(
+      fc.property(
+        midTravelArb,
+        fc.array(commandArb, { minLength: 1, maxLength: 30 }),
+        (midTravel, commands) => {
+          const machine = new DoorStateMachine({
+            openingTime: 15,
+            closingTime: 15,
+            midTravelBehaviour: midTravel,
+          });
+
+          for (const cmd of commands) {
+            applyCommand(machine, cmd);
+
+            if (machine.state === 'OPENING' || machine.state === 'CLOSING') {
+              expect(machine.lastTravelDirection).toBe(machine.state);
+            } else if (machine.state === 'OPEN' || machine.state === 'CLOSED') {
+              expect(machine.lastTravelDirection).toBeNull();
+            }
+          }
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it('one-push: the state after a pulse is what the cycle function predicts', () => {
+    fc.assert(
+      fc.property(
+        fc.array(commandArb, { minLength: 1, maxLength: 30 }),
+        (commands) => {
+          const machine = new DoorStateMachine({
+            openingTime: 15,
+            closingTime: 15,
+            midTravelBehaviour: 'one-push',
+          });
+
+          for (const cmd of commands) {
+            if (cmd.type === 'pulseCompleted') {
+              const predicted = nextOnePushOutcome(machine.state, machine.lastTravelDirection);
+              machine.pulseCompleted(cmd.target);
+              if (predicted !== 'UNKNOWN') {
+                expect(machine.state).toBe(predicted);
+              } else {
+                // Direction unknown: the requested target is assumed.
+                expect(machine.state).toBe(cmd.target === 'OPEN' ? 'OPENING' : 'CLOSING');
+              }
+            } else {
+              applyCommand(machine, cmd);
+            }
+          }
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+
+  it('requests only ever return pulse, no-op or unachievable, and only one-push refuses', () => {
+    fc.assert(
+      fc.property(
+        midTravelArb,
+        fc.array(commandArb, { minLength: 0, maxLength: 20 }),
+        (midTravel, setupCommands) => {
+          const machine = new DoorStateMachine({
+            openingTime: 15,
+            closingTime: 15,
+            midTravelBehaviour: midTravel,
+          });
+
+          for (const cmd of setupCommands) {
+            applyCommand(machine, cmd);
+          }
+
+          for (const action of [machine.requestOpen(), machine.requestClose()]) {
+            expect(['pulse', 'no-op', 'unachievable']).toContain(action);
+            if (midTravel !== 'one-push') {
+              expect(action).not.toBe('unachievable');
+            }
+          }
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
+
+  it('unachievable only arises from STOPPED with a known direction and changes nothing', () => {
+    fc.assert(
+      fc.property(
+        fc.array(commandArb, { minLength: 0, maxLength: 20 }),
+        (setupCommands) => {
+          const machine = new DoorStateMachine({
+            openingTime: 15,
+            closingTime: 15,
+            midTravelBehaviour: 'one-push',
+          });
+
+          for (const cmd of setupCommands) {
+            applyCommand(machine, cmd);
+          }
+
+          const stateBefore = machine.state;
+          const timerBefore = machine.hasTimer;
+          const memoryBefore = machine.lastTravelDirection;
+
+          for (const action of [machine.requestOpen(), machine.requestClose()]) {
+            if (action === 'unachievable') {
+              expect(stateBefore).toBe('STOPPED');
+              expect(memoryBefore).not.toBeNull();
+            }
+          }
+
+          expect(machine.state).toBe(stateBefore);
+          expect(machine.hasTimer).toBe(timerBefore);
+          expect(machine.lastTravelDirection).toBe(memoryBefore);
+        },
+      ),
+      { numRuns: 200 },
+    );
+  });
 });
 
 // ─── Property 5: State-to-Characteristic Mapping ───────────────────────────
@@ -218,8 +325,9 @@ describe('Property 5: State-to-Characteristic Mapping', () => {
       fc.property(doorStateArb, (state) => {
         const value = currentDoorStateValue(state);
         switch (state) {
-          case 'CLOSED': expect(value).toBe(0); break;
-          case 'OPEN': expect(value).toBe(1); break;
+          // HAP: OPEN = 0, CLOSED = 1.
+          case 'CLOSED': expect(value).toBe(1); break;
+          case 'OPEN': expect(value).toBe(0); break;
           case 'OPENING': expect(value).toBe(2); break;
           case 'CLOSING': expect(value).toBe(3); break;
           case 'STOPPED': expect(value).toBe(4); break;
@@ -246,6 +354,42 @@ describe('Property 5: State-to-Characteristic Mapping', () => {
       fc.property(doorStateArb, (state) => {
         const current = currentDoorStateValue(state);
         const target = targetDoorStateValue(state);
+        expect(current).toBeGreaterThanOrEqual(0);
+        expect(current).toBeLessThanOrEqual(4);
+        expect(target).toBeGreaterThanOrEqual(0);
+        expect(target).toBeLessThanOrEqual(1);
+      }),
+    );
+  });
+
+  it('the presentation mapping is the identity except for one-push STOPPED', () => {
+    fc.assert(
+      fc.property(doorStateArb, midTravelArb, travelDirectionArb, (state, midTravel, direction) => {
+        const shown = presentDoorState(state, midTravel, direction);
+        if (state !== 'STOPPED' || midTravel !== 'one-push') {
+          expect(shown).toBe(state);
+        }
+      }),
+    );
+  });
+
+  it('a one-push door is never presented as STOPPED', () => {
+    fc.assert(
+      fc.property(doorStateArb, travelDirectionArb, (state, direction) => {
+        const shown = presentDoorState(state, 'one-push', direction);
+        if (state === 'STOPPED') {
+          expect(shown).not.toBe('STOPPED');
+        }
+      }),
+    );
+  });
+
+  it('the presented state maps into the HAP ranges for every input', () => {
+    fc.assert(
+      fc.property(doorStateArb, midTravelArb, travelDirectionArb, (state, midTravel, direction) => {
+        const shown = presentDoorState(state, midTravel, direction);
+        const current = currentDoorStateValue(shown);
+        const target = targetDoorStateValue(shown);
         expect(current).toBeGreaterThanOrEqual(0);
         expect(current).toBeLessThanOrEqual(4);
         expect(target).toBeGreaterThanOrEqual(0);

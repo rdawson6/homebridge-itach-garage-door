@@ -113,7 +113,7 @@ Worked example with explicit timing and a webhook:
 | `pulseDuration` | integer | no | `500` | 100–2000 ms | How long the relay is held closed. |
 | `openingTime` | integer | no | `15` | 1–120 s | Time to travel fully open. |
 | `closingTime` | integer | no | `15` | 1–120 s | Time to travel fully closed. |
-| `midTravelBehaviour` | string | no | `stop` | `stop`, `reverse` | What your opener does when pressed mid-travel. |
+| `midTravelBehaviour` | string | no | `stop` | `stop`, `reverse`, `one-push` | What your opener does when pressed mid-travel. See [Opener behaviour](#opener-behaviour). |
 
 ### Webhook fields
 
@@ -128,6 +128,46 @@ Out-of-range numeric values fall back to the default and are logged at error lev
 ### Measuring your travel times
 
 Time the door with a stopwatch from the moment it starts moving until it comes to a full stop, in each direction, and use those values. Accurate times matter: they are the only thing telling the plugin where the door is.
+
+## Opener behaviour
+
+The relay only ever does one thing: press the button once. What that press *means* depends on your opener, so set `midTravelBehaviour` to match the hardware.
+
+| Value | Your opener does this | Press while moving |
+|---|---|---|
+| `stop` | Halts when pressed mid-travel, and the next press continues in the direction you ask for. | Door stops. |
+| `reverse` | Reverses when pressed mid-travel. Common on gates. | Door turns around. |
+| `one-push` | Single-button opener: one trigger input advancing a fixed cycle. | Door stops; the *next* press goes the opposite way to the last movement. |
+
+### Single-button (`one-push`) openers
+
+Many openers have one trigger input and advance a cycle, where the direction of the next press depends on which way the door last moved:
+
+```
+fully closed                 --press-->  opens
+while opening                --press-->  stops (never reverses)
+stopped, was opening         --press-->  closes
+while closing                --press-->  stops
+stopped, was closing         --press-->  opens
+fully open                   --press-->  closes
+```
+
+With `one-push` the plugin tracks the direction of the last travel leg, so it knows which way the next press will actually move the door and reports the real outcome rather than the direction that was asked for.
+
+**One press per request.** The plugin never fires an automatic sequence of presses. If you ask for a direction the next single press cannot achieve — asking for Open while the door is stopped part-way open, where the next press closes it — nothing is actuated, the door does not move, and a warning in the log names the door, its state and what the next press will do. Press again for the achievable direction. In the Home app this is hard to hit, because the tile offers exactly the one action the next press performs; the refusal exists for Siri, automations and other HomeKit clients.
+
+**What Apple Home shows for an interrupted door.** A `one-push` door interrupted mid-travel is never shown as "Stopped". It keeps showing Opening or Closing until something resolves it: the next press starting the opposite leg, a travel timer completing, a webhook correction, or a restart. This is deliberate and was chosen over settling the tile on Open. Consequences worth knowing:
+
+- Siri will describe the door as opening or closing while it is in fact stationary.
+- The transitional label has no timeout, so it can persist for as long as the door sits part-way.
+- Automations triggered by the door reaching Open or Closed will not fire until a leg actually completes.
+- When a press does start the opposite leg, the tile does not visibly change, because it was already showing that direction.
+
+Internally the plugin still knows the door is stopped, and `STOPPED` is what gets logged and persisted. Only the HomeKit presentation holds the travel direction.
+
+**After a restart.** The last travel direction is not persisted — the state file format is unchanged from v1.0.0 — so after a Homebridge restart a door that was mid-travel comes back as stopped with the direction unknown. Apple Home shows it as Open, and the next request is honoured rather than refused, with the assumed direction recorded as a warning in the log. If the assumption was wrong the reported state stays inverted until a full travel leg completes or a webhook corrects it.
+
+**Travel-time lag.** After an interrupted leg, the next leg still runs the full configured `openingTime` or `closingTime`, so the plugin can report a door as fully open or closed up to one travel time late. The plugin does not model partial positions.
 
 ## Multiple doors
 
@@ -223,7 +263,9 @@ The sensor now corrects the plugin whenever the door is operated by any means, i
 | `OPEN` | Opening travel timer expired, or a webhook said so. |
 | `OPENING` | A pulse was actuated toward open; the opening timer is running. |
 | `CLOSING` | A pulse was actuated toward closed; the closing timer is running. |
-| `STOPPED` | A pulse interrupted travel (`stop` mode), a webhook said so, or Homebridge restarted mid-travel. |
+| `STOPPED` | A pulse interrupted travel (`stop` or `one-push` mode), a webhook said so, or Homebridge restarted mid-travel. |
+
+On a `one-push` door the state after a press is whatever the opener's cycle produces, not what was requested, and a `STOPPED` door is presented to HomeKit as Opening, Closing or Open rather than Stopped. See [Single-button (`one-push`) openers](#single-button-one-push-openers).
 
 On restart, a door recorded as `OPEN`, `CLOSED`, or `STOPPED` is restored as-is. A door recorded mid-travel (`OPENING` / `CLOSING`) comes back as `STOPPED`, since its real position cannot be known. With no stored record, the door is assumed `CLOSED`.
 
@@ -243,7 +285,9 @@ Enable Homebridge debug logging (`homebridge -D`) to see every command sent and 
 
 **Door locked out after an error.** If the relay fails to release after 3 retries the plugin stops accepting actuation for that door to avoid leaving the relay energised. It clears automatically once a release succeeds; check the wiring and the IP2CC, then restart Homebridge.
 
-**Nothing happens mid-travel.** Check `midTravelBehaviour` matches what your opener physically does.
+**Nothing happens mid-travel.** Check `midTravelBehaviour` matches what your opener physically does. On a single-button opener, a tap that appears to do nothing is usually a request the next press cannot achieve — the log says so, and pressing for the other direction will move the door.
+
+**The tile says Opening or Closing but the door is not moving.** Expected on a `one-push` door that was interrupted mid-travel: the plugin holds the travel wording until the next press, a completed travel leg, a webhook correction, or a restart resolves it.
 
 ## Safety
 

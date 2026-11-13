@@ -94,9 +94,10 @@
               "default": "stop",
               "oneOf": [
                 { "title": "Stop (a press while moving stops the door)", "enum": ["stop"] },
-                { "title": "Reverse (a press while moving reverses the door)", "enum": ["reverse"] }
+                { "title": "Reverse (a press while moving reverses the door)", "enum": ["reverse"] },
+                { "title": "One push (a press while moving stops the door; the next press reverses)", "enum": ["one-push"] }
               ],
-              "description": "What your opener physically does when the button is pressed mid-travel."
+              "description": "What your opener physically does when the button is pressed mid-travel. Choose One push for a single-button opener, where one trigger advances a cycle and the direction of the next press depends on which way the door last moved."
             }
           }
         }

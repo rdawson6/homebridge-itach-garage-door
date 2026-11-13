@@ -355,13 +355,13 @@ function validateMidTravel(value: unknown, index: number, errors: ValidationErro
   if (value === undefined || value === null) {
     return DEFAULT_MID_TRAVEL;
   }
-  if (value === 'stop' || value === 'reverse') {
+  if (value === 'stop' || value === 'reverse' || value === 'one-push') {
     return value;
   }
   errors.push({
     index,
     field: 'midTravelBehaviour',
-    message: `Door_Entry at index ${index} has midTravelBehaviour="${String(value)}" outside {stop, reverse}; using default "${DEFAULT_MID_TRAVEL}".`,
+    message: `Door_Entry at index ${index} has midTravelBehaviour="${String(value)}" outside {stop, reverse, one-push}; using default "${DEFAULT_MID_TRAVEL}".`,
   });
   return DEFAULT_MID_TRAVEL;
 }

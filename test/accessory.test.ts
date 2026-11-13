@@ -3,13 +3,23 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { GarageDoorAccessory, toCurrentDoorState, toTargetDoorState } from '../src/accessory.js';
+import {
+  GarageDoorAccessory,
+  presentDoorState,
+  toCurrentDoorState,
+  toTargetDoorState,
+} from '../src/accessory.js';
 import { DoorStateMachine } from '../src/door-state-machine.js';
 import { PersistenceStore } from '../src/persistence-store.js';
 import { CommunicationError } from '../src/command-client.js';
 import type { PulseActuator, PulseResult, PulseTarget } from '../src/pulse-actuator.js';
 import type { Logger } from '../src/logger.js';
-import type { ValidatedDoorEntry } from '../src/types.js';
+import type {
+  DoorState,
+  MidTravelBehaviour,
+  TravelDirection,
+  ValidatedDoorEntry,
+} from '../src/types.js';
 import type {
   HapApiContainer,
   CharacteristicLike,
@@ -331,5 +341,199 @@ describe('characteristic mapping', () => {
     expect(toTargetDoorState('CLOSED')).toBe(1);
     expect(toTargetDoorState('CLOSING')).toBe(1);
     expect(toTargetDoorState('STOPPED')).toBe(1);
+  });
+});
+
+// ─── One-push presentation mapping ─────────────────────────────────────────
+
+describe('presentDoorState', () => {
+  const states: DoorState[] = ['CLOSED', 'OPEN', 'OPENING', 'CLOSING', 'STOPPED'];
+  const memories: Array<TravelDirection | null> = ['OPENING', 'CLOSING', null];
+
+  it.each<MidTravelBehaviour>(['stop', 'reverse'])('is the identity for every state in %s mode', (mode) => {
+    for (const state of states) {
+      for (const memory of memories) {
+        expect(presentDoorState(state, mode, memory)).toBe(state);
+      }
+    }
+  });
+
+  it('is the identity for every non-STOPPED state in one-push mode', () => {
+    for (const state of states.filter((s) => s !== 'STOPPED')) {
+      for (const memory of memories) {
+        expect(presentDoorState(state, 'one-push', memory)).toBe(state);
+      }
+    }
+  });
+
+  it('holds the travel direction for a one-push door stopped mid-travel', () => {
+    expect(presentDoorState('STOPPED', 'one-push', 'OPENING')).toBe('OPENING');
+    expect(presentDoorState('STOPPED', 'one-push', 'CLOSING')).toBe('CLOSING');
+  });
+
+  it('settles on OPEN for a one-push door stopped with an unknown direction', () => {
+    expect(presentDoorState('STOPPED', 'one-push', null)).toBe('OPEN');
+  });
+
+  it('never presents STOPPED in one-push mode', () => {
+    for (const memory of memories) {
+      expect(presentDoorState('STOPPED', 'one-push', memory)).not.toBe('STOPPED');
+    }
+  });
+});
+
+// ─── One-push door accessory behaviour ─────────────────────────────────────
+
+const ONE_PUSH_CONFIG: ValidatedDoorEntry = {
+  name: 'Garage',
+  ipAddress: '192.168.4.235',
+  relay: '1:1',
+  port: 4998,
+  doorId: 'garage',
+  pulseDuration: 500,
+  openingTime: 15,
+  closingTime: 15,
+  midTravelBehaviour: 'one-push',
+};
+
+describe('GarageDoorAccessory — one-push door', () => {
+  let hap: HapApiContainer;
+  let accessory: MockAccessory;
+  let sm: DoorStateMachine;
+  let actuator: MockActuator;
+  let persistence: PersistenceStore;
+  let log: Logger;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    hap = makeHap();
+    accessory = new MockAccessory();
+    sm = new DoorStateMachine({ openingTime: 15, closingTime: 15, midTravelBehaviour: 'one-push' });
+    actuator = new MockActuator();
+    log = makeLogger();
+    persistence = new PersistenceStore('/tmp/itach-accessory-one-push-test', log);
+    vi.spyOn(persistence, 'save').mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function build(): GarageDoorAccessory {
+    return new GarageDoorAccessory(
+      hap,
+      accessory,
+      ONE_PUSH_CONFIG,
+      sm,
+      actuator as unknown as PulseActuator,
+      persistence,
+      log,
+    );
+  }
+
+  function gdoService(): MockService {
+    return accessory.services.get(REF.GarageDoorOpener) as MockService;
+  }
+
+  function lastUpdate(ref: unknown): CharacteristicValue | undefined {
+    return gdoService().updates.filter((u) => u.ref === ref).pop()?.value;
+  }
+
+  it('shows Opening while internally STOPPED after an interrupted opening leg', async () => {
+    const acc = build();
+    await acc.handleTargetDoorStateSet(0); // open
+    await acc.handleTargetDoorStateSet(1); // interrupt → STOPPED
+
+    expect(sm.state).toBe('STOPPED');
+    expect(sm.lastTravelDirection).toBe('OPENING');
+    expect(lastUpdate(REF.CurrentDoorState)).toBe(2); // OPENING
+    expect(lastUpdate(REF.TargetDoorState)).toBe(0); // OPEN
+    expect(persistence.save).toHaveBeenCalledWith('192.168.4.235:1:1', 'STOPPED');
+  });
+
+  it('shows Closing while internally STOPPED after an interrupted closing leg', async () => {
+    sm.setExternalState('OPEN');
+    const acc = build();
+    await acc.handleTargetDoorStateSet(1); // close
+    await acc.handleTargetDoorStateSet(0); // interrupt → STOPPED
+
+    expect(sm.state).toBe('STOPPED');
+    expect(lastUpdate(REF.CurrentDoorState)).toBe(3); // CLOSING
+    expect(lastUpdate(REF.TargetDoorState)).toBe(1); // CLOSED
+  });
+
+  it('shows Open while internally STOPPED with an unknown direction', () => {
+    sm.restoreState({ '192.168.4.235:1:1': 'OPENING' }, '192.168.4.235:1:1');
+    build();
+
+    expect(sm.state).toBe('STOPPED');
+    expect(sm.lastTravelDirection).toBeNull();
+    expect(lastUpdate(REF.CurrentDoorState)).toBe(0); // OPEN
+    expect(lastUpdate(REF.TargetDoorState)).toBe(0); // OPEN
+  });
+
+  it('refuses a request the next press cannot achieve without actuating', async () => {
+    const acc = build();
+    await acc.handleTargetDoorStateSet(0); // open
+    await acc.handleTargetDoorStateSet(1); // interrupt → STOPPED (was opening)
+    actuator.calls.length = 0;
+    gdoService().updates.length = 0;
+
+    await expect(acc.handleTargetDoorStateSet(0)).resolves.toBeUndefined();
+
+    expect(actuator.calls).toHaveLength(0);
+    expect(sm.state).toBe('STOPPED');
+    expect(sm.lastTravelDirection).toBe('OPENING');
+    expect(log.warn).toHaveBeenCalled();
+    expect(lastUpdate(REF.CurrentDoorState)).toBe(2);
+    expect(lastUpdate(REF.TargetDoorState)).toBe(0);
+  });
+
+  it('honours the request the next press can achieve with exactly one pulse', async () => {
+    const acc = build();
+    await acc.handleTargetDoorStateSet(0);
+    await acc.handleTargetDoorStateSet(1);
+    actuator.calls.length = 0;
+
+    await acc.handleTargetDoorStateSet(1); // close — achievable from STOPPED(was opening)
+
+    expect(actuator.calls).toEqual(['CLOSED']);
+    expect(sm.state).toBe('CLOSING');
+  });
+
+  it('actuates exactly one pulse per write that is not a no-op or refusal', async () => {
+    const acc = build();
+
+    await acc.handleTargetDoorStateSet(0); // pulse → OPENING
+    await acc.handleTargetDoorStateSet(0); // no-op
+    await acc.handleTargetDoorStateSet(1); // pulse → STOPPED
+    await acc.handleTargetDoorStateSet(0); // unachievable → no pulse
+    await acc.handleTargetDoorStateSet(1); // pulse → CLOSING
+    await acc.handleTargetDoorStateSet(1); // no-op
+
+    expect(actuator.calls).toEqual(['OPEN', 'CLOSED', 'CLOSED']);
+    expect(sm.state).toBe('CLOSING');
+  });
+
+  it('warns when pulsing from STOPPED with an unknown direction', async () => {
+    sm.restoreState({ 'k': 'OPENING' }, 'k');
+    const acc = build();
+
+    await acc.handleTargetDoorStateSet(0);
+
+    expect(actuator.calls).toEqual(['OPEN']);
+    expect(sm.state).toBe('OPENING');
+    const warnings = (log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+    expect(warnings.some((m) => m.includes('no record of the last travel direction'))).toBe(true);
+  });
+
+  it('throws HapStatusError on pulse failure and leaves state and memory untouched', async () => {
+    const acc = build();
+    await acc.handleTargetDoorStateSet(0); // → OPENING
+    actuator.behaviour = () => Promise.reject(new CommunicationError('relay failed'));
+
+    await expect(acc.handleTargetDoorStateSet(1)).rejects.toBeInstanceOf(HapStatusErrorMock);
+    expect(sm.state).toBe('OPENING');
+    expect(sm.lastTravelDirection).toBe('OPENING');
   });
 });

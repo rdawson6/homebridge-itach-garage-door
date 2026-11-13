@@ -6,8 +6,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { DoorStateMachine } from '../src/door-state-machine.js';
-import type { DoorStateChangeEvent } from '../src/types.js';
+import { DoorStateMachine, nextOnePushOutcome } from '../src/door-state-machine.js';
+import type { DoorState, DoorStateChangeEvent, TravelDirection } from '../src/types.js';
 
 describe('DoorStateMachine', () => {
   beforeEach(() => {
@@ -469,5 +469,368 @@ describe('DoorStateMachine', () => {
       vi.advanceTimersByTime(1_000);
       expect(machine.state).toBe('CLOSED');
     });
+  });
+});
+
+// ─── One-Push (single-button) Mode ───────────────────────────────────────────
+
+describe('DoorStateMachine — mid-travel one-push mode', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function createMachine(opts?: Partial<{ openingTime: number; closingTime: number }>) {
+    return new DoorStateMachine({
+      openingTime: opts?.openingTime ?? 15,
+      closingTime: opts?.closingTime ?? 15,
+      midTravelBehaviour: 'one-push',
+    });
+  }
+
+  function collectEvents(machine: DoorStateMachine): DoorStateChangeEvent[] {
+    const events: DoorStateChangeEvent[] = [];
+    machine.on('stateChange', (e) => events.push(e));
+    return events;
+  }
+
+  /** Drive the machine to STOPPED having last been opening. */
+  function stoppedAfterOpening(machine: DoorStateMachine): void {
+    machine.requestOpen();
+    machine.pulseCompleted('OPEN');
+    machine.requestClose();
+    machine.pulseCompleted('CLOSED');
+  }
+
+  /** Drive the machine to STOPPED having last been closing. */
+  function stoppedAfterClosing(machine: DoorStateMachine): void {
+    machine.setExternalState('OPEN');
+    machine.requestClose();
+    machine.pulseCompleted('CLOSED');
+    machine.requestOpen();
+    machine.pulseCompleted('OPEN');
+  }
+
+  it('CLOSED + requestOpen → pulse → OPENING with the opening timer running', () => {
+    const machine = createMachine();
+    expect(machine.lastTravelDirection).toBeNull();
+
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+
+    expect(machine.state).toBe('OPENING');
+    expect(machine.hasTimer).toBe(true);
+    expect(machine.lastTravelDirection).toBe('OPENING');
+  });
+
+  it('OPENING + requestClose → pulse → STOPPED, no timer, direction remembered', () => {
+    const machine = createMachine();
+    const events = collectEvents(machine);
+
+    machine.requestOpen();
+    machine.pulseCompleted('OPEN');
+    events.length = 0;
+
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.hasTimer).toBe(false);
+    expect(machine.lastTravelDirection).toBe('OPENING');
+    expect(events[0]).toEqual({ previous: 'OPENING', current: 'STOPPED', trigger: 'homekit' });
+  });
+
+  it('STOPPED after opening + requestClose → pulse → CLOSING on the closing timer', () => {
+    const machine = createMachine({ openingTime: 10, closingTime: 20 });
+    stoppedAfterOpening(machine);
+    expect(machine.state).toBe('STOPPED');
+
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+
+    expect(machine.state).toBe('CLOSING');
+    expect(machine.hasTimer).toBe(true);
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+
+    vi.advanceTimersByTime(19_000);
+    expect(machine.state).toBe('CLOSING');
+    vi.advanceTimersByTime(1_000);
+    expect(machine.state).toBe('CLOSED');
+  });
+
+  it('CLOSING + requestOpen → pulse → STOPPED, direction remembered', () => {
+    const machine = createMachine();
+    machine.setExternalState('OPEN');
+    machine.requestClose();
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('CLOSING');
+
+    const events = collectEvents(machine);
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.hasTimer).toBe(false);
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+    expect(events[0]).toEqual({ previous: 'CLOSING', current: 'STOPPED', trigger: 'homekit' });
+  });
+
+  it('STOPPED after closing + requestOpen → pulse → OPENING on the opening timer', () => {
+    const machine = createMachine({ openingTime: 10, closingTime: 20 });
+    stoppedAfterClosing(machine);
+    expect(machine.state).toBe('STOPPED');
+
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+
+    expect(machine.state).toBe('OPENING');
+    expect(machine.hasTimer).toBe(true);
+    expect(machine.lastTravelDirection).toBe('OPENING');
+
+    vi.advanceTimersByTime(9_000);
+    expect(machine.state).toBe('OPENING');
+    vi.advanceTimersByTime(1_000);
+    expect(machine.state).toBe('OPEN');
+  });
+
+  it('STOPPED after opening + requestOpen → unachievable, nothing changes', () => {
+    const machine = createMachine();
+    stoppedAfterOpening(machine);
+    const events = collectEvents(machine);
+
+    expect(machine.requestOpen()).toBe('unachievable');
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.hasTimer).toBe(false);
+    expect(machine.lastTravelDirection).toBe('OPENING');
+    expect(events).toHaveLength(0);
+  });
+
+  it('STOPPED after closing + requestClose → unachievable, nothing changes', () => {
+    const machine = createMachine();
+    stoppedAfterClosing(machine);
+    const events = collectEvents(machine);
+
+    expect(machine.requestClose()).toBe('unachievable');
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.hasTimer).toBe(false);
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+    expect(events).toHaveLength(0);
+  });
+
+  it('requests that are already satisfied are no-ops', () => {
+    const machine = createMachine();
+
+    expect(machine.requestClose()).toBe('no-op'); // CLOSED
+
+    machine.requestOpen();
+    machine.pulseCompleted('OPEN');
+    expect(machine.state).toBe('OPENING');
+    expect(machine.requestOpen()).toBe('no-op');
+
+    machine.setExternalState('OPEN');
+    expect(machine.requestOpen()).toBe('no-op');
+
+    machine.requestClose();
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('CLOSING');
+    expect(machine.requestClose()).toBe('no-op');
+  });
+
+  it('OPEN + requestClose → pulse → CLOSING', () => {
+    const machine = createMachine();
+    machine.setExternalState('OPEN');
+
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('CLOSING');
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+  });
+
+  it('runs the full single-button cycle end to end, one pulse per request', () => {
+    const machine = createMachine({ openingTime: 10, closingTime: 20 });
+
+    const expectTimerInvariant = () => {
+      const travelling = machine.state === 'OPENING' || machine.state === 'CLOSING';
+      expect(machine.hasTimer).toBe(travelling);
+    };
+
+    // CLOSED → open
+    expect(machine.state).toBe('CLOSED');
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+    expect(machine.state).toBe('OPENING');
+    expect(machine.lastTravelDirection).toBe('OPENING');
+    expectTimerInvariant();
+
+    // OPENING → interrupted
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.lastTravelDirection).toBe('OPENING');
+    expectTimerInvariant();
+
+    // STOPPED (was opening) → the next press closes
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('CLOSING');
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+    expectTimerInvariant();
+
+    // CLOSING → interrupted
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+    expect(machine.state).toBe('STOPPED');
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+    expectTimerInvariant();
+
+    // STOPPED (was closing) → the next press opens
+    expect(machine.requestOpen()).toBe('pulse');
+    machine.pulseCompleted('OPEN');
+    expect(machine.state).toBe('OPENING');
+    expect(machine.lastTravelDirection).toBe('OPENING');
+    expectTimerInvariant();
+
+    // Opening leg completes
+    vi.advanceTimersByTime(10_000);
+    expect(machine.state).toBe('OPEN');
+    expect(machine.lastTravelDirection).toBeNull();
+    expectTimerInvariant();
+
+    // OPEN → close
+    expect(machine.requestClose()).toBe('pulse');
+    machine.pulseCompleted('CLOSED');
+    expect(machine.state).toBe('CLOSING');
+    expect(machine.lastTravelDirection).toBe('CLOSING');
+    expectTimerInvariant();
+
+    // Closing leg completes
+    vi.advanceTimersByTime(20_000);
+    expect(machine.state).toBe('CLOSED');
+    expect(machine.lastTravelDirection).toBeNull();
+    expectTimerInvariant();
+  });
+
+  describe('direction memory maintenance', () => {
+    it('timer completion to a terminal state clears the memory', () => {
+      const machine = createMachine();
+      machine.requestOpen();
+      machine.pulseCompleted('OPEN');
+      expect(machine.lastTravelDirection).toBe('OPENING');
+
+      vi.advanceTimersByTime(15_000);
+      expect(machine.state).toBe('OPEN');
+      expect(machine.lastTravelDirection).toBeNull();
+    });
+
+    it('a webhook setting OPENING or CLOSING sets the memory', () => {
+      const machine = createMachine();
+      machine.setExternalState('OPENING');
+      expect(machine.lastTravelDirection).toBe('OPENING');
+      machine.setExternalState('CLOSING');
+      expect(machine.lastTravelDirection).toBe('CLOSING');
+    });
+
+    it('a webhook setting OPEN or CLOSED clears the memory', () => {
+      const machine = createMachine();
+      machine.setExternalState('OPENING');
+      machine.setExternalState('OPEN');
+      expect(machine.lastTravelDirection).toBeNull();
+
+      machine.setExternalState('CLOSING');
+      machine.setExternalState('CLOSED');
+      expect(machine.lastTravelDirection).toBeNull();
+    });
+
+    it('a webhook setting STOPPED preserves the memory', () => {
+      const machine = createMachine();
+      machine.setExternalState('OPENING');
+      machine.setExternalState('STOPPED');
+      expect(machine.state).toBe('STOPPED');
+      expect(machine.lastTravelDirection).toBe('OPENING');
+    });
+  });
+
+  describe('unknown direction after a restart', () => {
+    it.each<DoorState>(['OPENING', 'CLOSING'])(
+      'restores persisted %s as STOPPED with no direction memory',
+      (persisted) => {
+        const machine = createMachine();
+        machine.restoreState({ 'key': persisted }, 'key');
+        expect(machine.state).toBe('STOPPED');
+        expect(machine.lastTravelDirection).toBeNull();
+      },
+    );
+
+    it('honours an open request and assumes it was achieved', () => {
+      const machine = createMachine();
+      machine.restoreState({ 'key': 'OPENING' }, 'key');
+
+      expect(machine.requestOpen()).toBe('pulse');
+      machine.pulseCompleted('OPEN');
+      expect(machine.state).toBe('OPENING');
+      expect(machine.lastTravelDirection).toBe('OPENING');
+    });
+
+    it('honours a close request and assumes it was achieved', () => {
+      const machine = createMachine();
+      machine.restoreState({ 'key': 'CLOSING' }, 'key');
+
+      expect(machine.requestClose()).toBe('pulse');
+      machine.pulseCompleted('CLOSED');
+      expect(machine.state).toBe('CLOSING');
+      expect(machine.lastTravelDirection).toBe('CLOSING');
+    });
+  });
+
+  describe('pulseFailed', () => {
+    it('leaves state, timer and direction memory untouched while travelling', () => {
+      const machine = createMachine();
+      machine.requestOpen();
+      machine.pulseCompleted('OPEN');
+
+      machine.pulseFailed();
+      expect(machine.state).toBe('OPENING');
+      expect(machine.hasTimer).toBe(true);
+      expect(machine.lastTravelDirection).toBe('OPENING');
+    });
+
+    it('leaves state, timer and direction memory untouched when stopped', () => {
+      const machine = createMachine();
+      stoppedAfterOpening(machine);
+
+      machine.pulseFailed();
+      expect(machine.state).toBe('STOPPED');
+      expect(machine.hasTimer).toBe(false);
+      expect(machine.lastTravelDirection).toBe('OPENING');
+    });
+  });
+});
+
+// ─── nextOnePushOutcome ──────────────────────────────────────────────────────
+
+describe('nextOnePushOutcome', () => {
+  const cases: Array<[DoorState, TravelDirection | null, DoorState | 'UNKNOWN']> = [
+    ['CLOSED', null, 'OPENING'],
+    ['CLOSED', 'OPENING', 'OPENING'],
+    ['CLOSED', 'CLOSING', 'OPENING'],
+    ['OPEN', null, 'CLOSING'],
+    ['OPEN', 'OPENING', 'CLOSING'],
+    ['OPEN', 'CLOSING', 'CLOSING'],
+    ['OPENING', null, 'STOPPED'],
+    ['OPENING', 'OPENING', 'STOPPED'],
+    ['OPENING', 'CLOSING', 'STOPPED'],
+    ['CLOSING', null, 'STOPPED'],
+    ['CLOSING', 'OPENING', 'STOPPED'],
+    ['CLOSING', 'CLOSING', 'STOPPED'],
+    ['STOPPED', 'OPENING', 'CLOSING'],
+    ['STOPPED', 'CLOSING', 'OPENING'],
+    ['STOPPED', null, 'UNKNOWN'],
+  ];
+
+  it.each(cases)('%s with memory %s → %s', (state, memory, expected) => {
+    expect(nextOnePushOutcome(state, memory)).toBe(expected);
   });
 });

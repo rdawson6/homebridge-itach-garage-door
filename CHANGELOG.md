@@ -5,6 +5,32 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `midTravelBehaviour: "one-push"` for single-button openers, where one trigger
+  input advances a fixed cycle and the direction of the next press depends on
+  which way the door last moved: closed → opens, pressed while moving → stops,
+  pressed again → moves opposite to the last leg.
+- Direction memory in the door state machine, so a door stopped mid-travel
+  knows which way the next press will move it and reports the outcome the
+  opener actually produces rather than the direction that was requested.
+  It is auxiliary data: the five `DoorState` values and the persisted state
+  file format are unchanged.
+- A refusal path for a request a single press cannot achieve on a `one-push`
+  door. Nothing is actuated, the door state is left alone, and a warning names
+  the door, its state and what the next press will do. One press per HomeKit
+  request; the plugin never sequences presses automatically.
+
+### Changed
+
+- Apple Home presentation for `one-push` doors only: a door interrupted
+  mid-travel shows Opening or Closing (or Open when the direction is unknown,
+  such as after a restart) instead of Stopped. Internally, in the log and on
+  disk the state is still `STOPPED`. Doors on `stop` or `reverse` are
+  unaffected and still present Stopped, and `stop` remains the default.
+
 ## [1.0.1] — 2026-11-11
 
 ### Changed

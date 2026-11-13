@@ -100,6 +100,28 @@ describe('Property 6: Configuration Validation — Ranges and Defaults', () => {
     );
   });
 
+  it('midTravelBehaviour is always one of the accepted values, defaulting to stop', () => {
+    fc.assert(
+      fc.property(
+        fc.oneof(fc.string(), fc.constantFrom('stop', 'reverse', 'one-push')),
+        (value) => {
+          const result = validateConfig([baseEntry({ midTravelBehaviour: value })]);
+          const door = result.doors[0]!;
+          expect(['stop', 'reverse', 'one-push']).toContain(door.midTravelBehaviour);
+
+          if (value === 'reverse' || value === 'one-push') {
+            expect(door.midTravelBehaviour).toBe(value);
+            expect(result.errors.some(e => e.field === 'midTravelBehaviour')).toBe(false);
+          } else {
+            expect(door.midTravelBehaviour).toBe('stop');
+            expect(result.errors.some(e => e.field === 'midTravelBehaviour')).toBe(value !== 'stop');
+          }
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+
   it('non-integer numeric fields fall back to default', () => {
     fc.assert(
       fc.property(

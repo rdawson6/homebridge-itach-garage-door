@@ -237,6 +237,29 @@ describe('ItachGarageDoorPlatform', () => {
       expect(messages.some((m) => m.includes('garage'))).toBe(true);
     });
 
+    it('carries a one-push door through to its state machine', async () => {
+      const platform = build({ doors: [door({ midTravelBehaviour: 'one-push' })] });
+      await platform.discoverDevices();
+
+      const runtime = platform.getDoor('garage');
+      expect(runtime?.config.midTravelBehaviour).toBe('one-push');
+
+      // The single-button cycle is live: an interrupted opening leg stops the
+      // door and remembers the direction, so the next press closes it.
+      const sm = runtime!.stateMachine;
+      expect(sm.requestOpen()).toBe('pulse');
+      sm.pulseCompleted('OPEN');
+      expect(sm.state).toBe('OPENING');
+
+      expect(sm.requestClose()).toBe('pulse');
+      sm.pulseCompleted('CLOSED');
+      expect(sm.state).toBe('STOPPED');
+      expect(sm.lastTravelDirection).toBe('OPENING');
+      expect(sm.requestOpen()).toBe('unachievable');
+
+      sm.cancelTimer();
+    });
+
     it('registers nothing for an empty door array', async () => {
       const platform = build({ doors: [] });
       await platform.discoverDevices();

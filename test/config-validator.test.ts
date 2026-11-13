@@ -199,6 +199,12 @@ describe('validateConfig', () => {
       expect(result.doors[0]!.midTravelBehaviour).toBe('stop');
       expect(result.errors.some(e => e.field === 'midTravelBehaviour')).toBe(true);
     });
+
+    it('midTravelBehaviour one-push is accepted unchanged', () => {
+      const result = validateConfig([baseEntry({ midTravelBehaviour: 'one-push' })]);
+      expect(result.doors[0]!.midTravelBehaviour).toBe('one-push');
+      expect(result.errors).toHaveLength(0);
+    });
   });
 
   // ─── Max 8 doors (just verify large arrays validate independently) ─────────

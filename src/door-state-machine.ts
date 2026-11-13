@@ -14,13 +14,62 @@
  * Mid-travel behaviours:
  * - 'stop': any pulse during travel → STOPPED
  * - 'reverse': pulse for opposite direction → reverses; same direction → no-op
+ * - 'one-push': single-button opener following a fixed cycle, where the next
+ *   pulse's direction depends on the direction of the last movement:
+ *
+ *     CLOSED            --pulse-->  OPENING
+ *     OPENING           --pulse-->  STOPPED   (stops, never reverses)
+ *     STOPPED (was opening) --pulse-->  CLOSING
+ *     CLOSING           --pulse-->  STOPPED
+ *     STOPPED (was closing) --pulse-->  OPENING
+ *     OPEN              --pulse-->  CLOSING
+ *
+ *   The direction of the last travel leg is held in auxiliary direction
+ *   memory (`lastTravelDirection`), because DoorState.STOPPED carries none.
  */
 
 import { EventEmitter } from 'events';
-import type { DoorState, DoorStateChangeEvent, MidTravelBehaviour, PersistedState } from './types.js';
+import type {
+  DoorState,
+  DoorStateChangeEvent,
+  MidTravelBehaviour,
+  PersistedState,
+  TravelDirection,
+} from './types.js';
 
-/** Action the caller should take after a request. */
-export type PulseAction = 'pulse' | 'no-op';
+/**
+ * Action the caller should take after a request.
+ *
+ * 'unachievable' means the requested direction cannot be reached with a single
+ * pulse — only possible on a 'one-push' opener stopped mid-travel, where the
+ * next press moves the door the other way. The caller must not actuate.
+ */
+export type PulseAction = 'pulse' | 'no-op' | 'unachievable';
+
+/**
+ * What a single pulse does to a one-push opener, given where the door is and
+ * how it last moved. Pure and total; returns 'UNKNOWN' when the door is
+ * stopped mid-travel and the last travel direction is not known.
+ */
+export function nextOnePushOutcome(
+  state: DoorState,
+  lastDirection: TravelDirection | null,
+): DoorState | 'UNKNOWN' {
+  switch (state) {
+    case 'CLOSED': return 'OPENING';
+    case 'OPEN': return 'CLOSING';
+    case 'OPENING': return 'STOPPED';
+    case 'CLOSING': return 'STOPPED';
+    case 'STOPPED':
+      if (lastDirection === 'OPENING') {
+        return 'CLOSING';
+      }
+      if (lastDirection === 'CLOSING') {
+        return 'OPENING';
+      }
+      return 'UNKNOWN';
+  }
+}
 
 export interface DoorStateMachineOptions {
   /** Time in seconds for the door to travel from closed to open. */
@@ -49,6 +98,7 @@ export interface DoorStateMachineEvents {
  */
 export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
   private _state: DoorState = 'CLOSED';
+  private _lastTravelDirection: TravelDirection | null = null;
   private _travelTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly openingTime: number;
   private readonly closingTime: number;
@@ -66,6 +116,16 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
     return this._state;
   }
 
+  /**
+   * Direction of the most recent travel leg, or null when unknown (after a
+   * restart) or irrelevant (the door is at a terminal position). Auxiliary
+   * data, not a door state: it is never persisted and is only read by the
+   * 'one-push' logic and the HomeKit presentation layer.
+   */
+  get lastTravelDirection(): TravelDirection | null {
+    return this._lastTravelDirection;
+  }
+
   /** Whether a travel timer is currently active. */
   get hasTimer(): boolean {
     return this._travelTimer !== null;
@@ -80,8 +140,13 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
    * - OPEN or OPENING → 'no-op'
    * - CLOSING + 'stop' mode → 'pulse' (will transition to STOPPED)
    * - CLOSING + 'reverse' mode → 'pulse' (will transition to OPENING)
+   * - 'one-push' mode → see `requestOnePush`; may return 'unachievable'
    */
   requestOpen(): PulseAction {
+    if (this.midTravelBehaviour === 'one-push') {
+      return this.requestOnePush('OPEN');
+    }
+
     switch (this._state) {
       case 'CLOSED':
       case 'STOPPED':
@@ -103,8 +168,13 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
    * - CLOSED or CLOSING → 'no-op'
    * - OPENING + 'stop' mode → 'pulse' (will transition to STOPPED)
    * - OPENING + 'reverse' mode → 'pulse' (will transition to CLOSING)
+   * - 'one-push' mode → see `requestOnePush`; may return 'unachievable'
    */
   requestClose(): PulseAction {
+    if (this.midTravelBehaviour === 'one-push') {
+      return this.requestOnePush('CLOSED');
+    }
+
     switch (this._state) {
       case 'OPEN':
       case 'STOPPED':
@@ -127,6 +197,11 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
    */
   pulseCompleted(requestedTarget: 'OPEN' | 'CLOSED'): void {
     const previous = this._state;
+
+    if (this.midTravelBehaviour === 'one-push') {
+      this.handleOnePushPulse(requestedTarget);
+      return;
+    }
 
     if (requestedTarget === 'OPEN') {
       this.handleOpenPulse(previous);
@@ -151,7 +226,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
     const previous = this._state;
     this.cancelTimer();
 
-    this._state = state;
+    this.assignState(state);
 
     // Start a timer if the new state is a travel state
     if (state === 'OPENING') {
@@ -169,19 +244,25 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
    * Restore state from persisted storage on startup.
    * OPENING/CLOSING states are restored as STOPPED (we can't know the position).
    * Invalid/missing states default to CLOSED.
+   *
+   * Direction memory is deliberately not persisted (it would change the state
+   * file format), so it is left unknown after a restore. On a one-push door
+   * that means the next request is honoured and its direction assumed.
    */
   restoreState(persisted: PersistedState, key: string): void {
     const savedState = persisted[key];
     const previous = this._state;
 
+    this._lastTravelDirection = null;
+
     if (savedState === undefined || !isValidDoorState(savedState)) {
       // Missing or invalid → CLOSED
-      this._state = 'CLOSED';
+      this.assignState('CLOSED');
     } else if (savedState === 'OPENING' || savedState === 'CLOSING') {
       // Travel states → STOPPED (position unknown after restart)
-      this._state = 'STOPPED';
+      this.assignState('STOPPED');
     } else {
-      this._state = savedState;
+      this.assignState(savedState);
     }
 
     if (previous !== this._state) {
@@ -199,7 +280,97 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
     }
   }
 
+  // ─── One-push (single-button) cycle ────────────────────────────────────────
+
+  /**
+   * Decide the action for a request on a single-button opener.
+   *
+   * Exactly one pulse is ever reported; the plugin never sequences presses.
+   * A request the next press cannot achieve returns 'unachievable' so the
+   * caller actuates nothing.
+   */
+  private requestOnePush(target: 'OPEN' | 'CLOSED'): PulseAction {
+    // Already satisfied — nothing to do (as in the other behaviours).
+    if (target === 'OPEN' && (this._state === 'OPEN' || this._state === 'OPENING')) {
+      return 'no-op';
+    }
+    if (target === 'CLOSED' && (this._state === 'CLOSED' || this._state === 'CLOSING')) {
+      return 'no-op';
+    }
+
+    const outcome = nextOnePushOutcome(this._state, this._lastTravelDirection);
+
+    // Direction unknown (post-restart, or a webhook set STOPPED): honour the
+    // request rather than leaving the door inert, and assume it was reached.
+    if (outcome === 'UNKNOWN') {
+      return 'pulse';
+    }
+
+    // Interrupting travel stops the door — physically what the press does.
+    if (outcome === 'STOPPED') {
+      return 'pulse';
+    }
+
+    const wanted: DoorState = target === 'OPEN' ? 'OPENING' : 'CLOSING';
+    return outcome === wanted ? 'pulse' : 'unachievable';
+  }
+
+  /**
+   * Advance the single-button cycle after a successful pulse.
+   *
+   * The outcome is recomputed from the state at completion time, not from the
+   * requested target, so a webhook correction landing between the request and
+   * the pulse completing is respected. The requested target is only consulted
+   * when the direction memory is unknown.
+   */
+  private handleOnePushPulse(requestedTarget: 'OPEN' | 'CLOSED'): void {
+    const outcome = nextOnePushOutcome(this._state, this._lastTravelDirection);
+    const next: DoorState = outcome === 'UNKNOWN'
+      ? (requestedTarget === 'OPEN' ? 'OPENING' : 'CLOSING')
+      : outcome;
+
+    this.transitionTo(next, 'homekit');
+  }
+
+  /**
+   * Move to `next`, maintaining the travel timer and direction memory.
+   * Used by the one-push path only; 'stop' and 'reverse' keep their own
+   * transition handlers untouched.
+   */
+  private transitionTo(next: DoorState, trigger: DoorStateChangeEvent['trigger']): void {
+    const previous = this._state;
+
+    this.cancelTimer();
+    this.assignState(next);
+
+    if (next === 'OPENING') {
+      this.startTimer(this.openingTime * 1000, 'OPEN');
+    } else if (next === 'CLOSING') {
+      this.startTimer(this.closingTime * 1000, 'CLOSED');
+    }
+
+    if (previous !== next) {
+      this.emitChange(previous, next, trigger);
+    }
+  }
+
   // ─── Internal State Transitions ────────────────────────────────────────────
+
+  /**
+   * The single place `_state` is assigned, so direction memory can never drift
+   * from it: entering a travel state records the direction, reaching a
+   * terminal position clears it, and STOPPED preserves whatever the
+   * interrupted leg recorded.
+   */
+  private assignState(next: DoorState): void {
+    this._state = next;
+
+    if (next === 'OPENING' || next === 'CLOSING') {
+      this._lastTravelDirection = next;
+    } else if (next === 'OPEN' || next === 'CLOSED') {
+      this._lastTravelDirection = null;
+    }
+  }
 
   private handleOpenPulse(previous: DoorState): void {
     switch (previous) {
@@ -207,7 +378,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
       case 'STOPPED':
         // Start opening
         this.cancelTimer();
-        this._state = 'OPENING';
+        this.assignState('OPENING');
         this.startTimer(this.openingTime * 1000, 'OPEN');
         this.emitChange(previous, 'OPENING', 'homekit');
         break;
@@ -216,12 +387,12 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
         if (this.midTravelBehaviour === 'stop') {
           // Any pulse during travel → STOPPED
           this.cancelTimer();
-          this._state = 'STOPPED';
+          this.assignState('STOPPED');
           this.emitChange(previous, 'STOPPED', 'homekit');
         } else {
           // 'reverse' mode: opposite direction → reverse
           this.cancelTimer();
-          this._state = 'OPENING';
+          this.assignState('OPENING');
           this.startTimer(this.openingTime * 1000, 'OPEN');
           this.emitChange(previous, 'OPENING', 'homekit');
         }
@@ -231,7 +402,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
         if (this.midTravelBehaviour === 'stop') {
           // Pulse during same-direction travel in stop mode → STOPPED
           this.cancelTimer();
-          this._state = 'STOPPED';
+          this.assignState('STOPPED');
           this.emitChange(previous, 'STOPPED', 'homekit');
         }
         // 'reverse' mode + same direction = no-op (shouldn't reach here via requestOpen)
@@ -249,7 +420,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
       case 'STOPPED':
         // Start closing
         this.cancelTimer();
-        this._state = 'CLOSING';
+        this.assignState('CLOSING');
         this.startTimer(this.closingTime * 1000, 'CLOSED');
         this.emitChange(previous, 'CLOSING', 'homekit');
         break;
@@ -258,12 +429,12 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
         if (this.midTravelBehaviour === 'stop') {
           // Any pulse during travel → STOPPED
           this.cancelTimer();
-          this._state = 'STOPPED';
+          this.assignState('STOPPED');
           this.emitChange(previous, 'STOPPED', 'homekit');
         } else {
           // 'reverse' mode: opposite direction → reverse
           this.cancelTimer();
-          this._state = 'CLOSING';
+          this.assignState('CLOSING');
           this.startTimer(this.closingTime * 1000, 'CLOSED');
           this.emitChange(previous, 'CLOSING', 'homekit');
         }
@@ -273,7 +444,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
         if (this.midTravelBehaviour === 'stop') {
           // Pulse during same-direction travel in stop mode → STOPPED
           this.cancelTimer();
-          this._state = 'STOPPED';
+          this.assignState('STOPPED');
           this.emitChange(previous, 'STOPPED', 'homekit');
         }
         // 'reverse' mode + same direction = no-op (shouldn't reach here via requestClose)
@@ -289,7 +460,7 @@ export class DoorStateMachine extends EventEmitter<DoorStateMachineEvents> {
     this._travelTimer = setTimeout(() => {
       this._travelTimer = null;
       const previous = this._state;
-      this._state = targetState;
+      this.assignState(targetState);
       this.emitChange(previous, targetState, 'timer');
     }, durationMs);
 

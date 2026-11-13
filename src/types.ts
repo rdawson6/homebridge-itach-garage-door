@@ -12,8 +12,21 @@
 /** All possible states of a garage door. */
 export type DoorState = 'CLOSED' | 'OPEN' | 'OPENING' | 'CLOSING' | 'STOPPED';
 
-/** Behaviour when a command is issued while the door is mid-travel. */
-export type MidTravelBehaviour = 'stop' | 'reverse';
+/**
+ * Behaviour when a command is issued while the door is mid-travel.
+ *
+ * - 'stop': a press while moving halts the door
+ * - 'reverse': a press while moving reverses the door
+ * - 'one-push': single-button opener — a press while moving halts the door and
+ *   the next press moves it opposite to the last travel direction
+ */
+export type MidTravelBehaviour = 'stop' | 'reverse' | 'one-push';
+
+/**
+ * Direction of a travel leg. Used as auxiliary direction memory for one-push
+ * openers; it is not a door state and is never persisted.
+ */
+export type TravelDirection = 'OPENING' | 'CLOSING';
 
 // ---------------------------------------------------------------------------
 // Configuration

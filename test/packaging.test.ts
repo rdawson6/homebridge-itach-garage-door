@@ -116,6 +116,14 @@ describe('config schema', () => {
     expect(props['doorId']!['pattern']).toBe('^[a-z0-9-]{1,64}$');
   });
 
+  it('offers exactly the midTravelBehaviour values the validator accepts, defaulting to stop', () => {
+    const props = schema.schema.properties.doors.items.properties;
+    const field = props['midTravelBehaviour']!;
+    const options = field['oneOf'] as Array<{ enum: string[] }>;
+    expect(options.flatMap((o) => o.enum)).toEqual(['stop', 'reverse', 'one-push']);
+    expect(field['default']).toBe('stop');
+  });
+
   it('declares webhook port and token constraints matching the validator', () => {
     const props = schema.schema.properties.webhook.properties;
     expect(props['port']).toMatchObject({ minimum: 1024, maximum: 65535 });
