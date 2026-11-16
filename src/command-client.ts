@@ -39,6 +39,19 @@ export const MAX_BACKOFF_MS = 60_000;
 /** Connection grace period in milliseconds — last-known values returned during this window. */
 export const GRACE_PERIOD_MS = 30_000;
 
+/**
+ * How long an unsent command is held while the client reconnects.
+ *
+ * Budget: Requirement 3.6 mandates a 1000ms wait before the first reconnect
+ * attempt, and connect plus the getdevices round trip costs roughly another
+ * 100ms on the LAN (the live log shows the IP2CC back in about a second). That
+ * leaves ~900ms of margin while keeping the whole HomeKit write inside
+ * hap-nodejs's 9000ms write budget even at the maximum 2000ms pulse duration.
+ * Deliberately *not* the 30s grace period: a relay that fires 25 seconds after
+ * the user was told the write failed would move a door nobody is watching.
+ */
+export const RECONNECT_HOLD_MS = 2000;
+
 /** The getdevices command string, used to detect multi-frame replies. */
 const GET_DEVICES_COMMAND = 'getdevices';
 
@@ -70,14 +83,65 @@ interface QueueEntry {
   command: string;
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
+  /**
+   * True once this command has been written to a socket. Set immediately before
+   * the write and never cleared, so an entry is written at most once in its
+   * lifetime. This is the whole double-actuation guard: a `setstate <relay>,1`
+   * that reached a socket is never written again, because TCP cannot tell us
+   * whether the IP2CC acted on it.
+   */
+  written: boolean;
+  /** Timer that fails this entry if no connection arrives in time. */
+  holdTimer: ReturnType<typeof setTimeout> | null;
+}
+
+/** How a CommunicationError came about, so callers can react proportionately. */
+export interface CommunicationErrorInfo {
+  /**
+   * The failure was in the connection rather than in the device's answer: no
+   * usable connection carried the command, the connection closed before a
+   * response arrived, or no response arrived at all. An `ERR_nnn` reply from
+   * the IP2CC is *not* connection-level.
+   */
+  connectionLevel?: boolean;
+  /**
+   * The command had already been written to a socket when it failed, so whether
+   * the IP2CC received and acted on it cannot be determined.
+   */
+  deliveryUncertain?: boolean;
+  /**
+   * The connection had been lost for less than the grace period at the moment
+   * this failure was reported, judged then rather than re-derived later.
+   */
+  withinGracePeriod?: boolean;
 }
 
 /** Error thrown/rejected when a command cannot be completed. */
 export class CommunicationError extends Error {
-  constructor(message: string) {
+  readonly connectionLevel: boolean;
+  readonly deliveryUncertain: boolean;
+  readonly withinGracePeriod: boolean;
+
+  constructor(message: string, info: CommunicationErrorInfo = {}) {
     super(message);
     this.name = 'CommunicationError';
+    this.connectionLevel = info.connectionLevel ?? false;
+    this.deliveryUncertain = info.deliveryUncertain ?? false;
+    this.withinGracePeriod = info.withinGracePeriod ?? false;
   }
+}
+
+/**
+ * Whether a failure is a connection drop the client is expected to recover from
+ * shortly, as opposed to a device fault or an IP2CC that is simply not there.
+ *
+ * The grace period (30s) is the dividing line, and it is the same boundary
+ * Requirement 3.8 already uses to decide when a lost connection stops being
+ * tolerated. A client that has never connected has no loss timestamp, so it is
+ * never transient.
+ */
+export function isTransientConnectionFailure(err: unknown): boolean {
+  return err instanceof CommunicationError && err.connectionLevel && err.withinGracePeriod;
 }
 
 // ─── CommandClient ───────────────────────────────────────────────────────────
@@ -162,9 +226,11 @@ export class CommandClient {
         this.log.error(`Connection to ${this.host}:${this.port} timed out after ${CONNECT_TIMEOUT_MS}ms`);
         this.connecting = false;
         this.teardownSocket();
-        this.flushQueue(new CommunicationError('Connection attempt timed out'));
+        // Requirement 3.11 requires the queue to be discarded here; the hold
+        // across a reconnect deliberately does not extend to this path.
+        this.flushQueue(this.connectionError('Connection attempt timed out'));
         this.scheduleReconnect();
-        reject(new CommunicationError('Connection attempt timed out'));
+        reject(this.connectionError('Connection attempt timed out'));
       }, CONNECT_TIMEOUT_MS);
       if (this.connectTimer.unref) {
         this.connectTimer.unref();
@@ -216,11 +282,13 @@ export class CommandClient {
     this._isConnected = false;
     this.connecting = false;
 
-    // Reject the in-flight command, if any.
+    // Reject the in-flight command, if any. It was written, so whether the
+    // IP2CC acted on it is unknown — say so rather than implying it was lost.
     if (this.inFlight !== null) {
       const entry = this.inFlight;
       this.inFlight = null;
-      entry.reject(new CommunicationError('Client disconnected'));
+      this.clearHold(entry);
+      entry.reject(new CommunicationError('Client disconnected', { deliveryUncertain: entry.written }));
     }
 
     this.flushQueue(new CommunicationError('Client disconnected'));
@@ -243,8 +311,14 @@ export class CommandClient {
         return;
       }
 
-      const entry: QueueEntry = { command, resolve, reject };
+      const entry: QueueEntry = { command, resolve, reject, written: false, holdTimer: null };
       this.queue.push(entry);
+
+      // Nothing can carry this command yet, so hold it rather than failing it:
+      // the IP2CC drops sessions periodically and is back in about a second.
+      if (!this._isConnected) {
+        this.armHold(entry);
+      }
 
       // Kick off a connection if needed; otherwise try to dispatch.
       if (!this._isConnected && !this.connecting) {
@@ -254,6 +328,53 @@ export class CommandClient {
       } else if (this._isConnected) {
         this.dispatchNext();
       }
+    });
+  }
+
+  /**
+   * Start (but never extend) the hold timer for a command that has no
+   * connection to travel on. On expiry the command is failed as a connection
+   * error without ever having been written, so the caller knows the device was
+   * not touched.
+   */
+  private armHold(entry: QueueEntry): void {
+    if (entry.holdTimer !== null) {
+      return;
+    }
+    entry.holdTimer = setTimeout(() => {
+      entry.holdTimer = null;
+      const index = this.queue.indexOf(entry);
+      if (index === -1) {
+        return;
+      }
+      this.queue.splice(index, 1);
+      this.log.error(
+        `Command "${truncate(entry.command, 256)}" to ${this.host}:${this.port} was never sent: ` +
+        `no connection became available within ${RECONNECT_HOLD_MS}ms`,
+      );
+      entry.reject(this.connectionError('Connection unavailable; command never sent'));
+    }, RECONNECT_HOLD_MS);
+    if (entry.holdTimer.unref) {
+      entry.holdTimer.unref();
+    }
+  }
+
+  private clearHold(entry: QueueEntry): void {
+    if (entry.holdTimer !== null) {
+      clearTimeout(entry.holdTimer);
+      entry.holdTimer = null;
+    }
+  }
+
+  /**
+   * Build a connection-level error, reading the grace-period verdict now rather
+   * than leaving the caller to re-derive it from a clock that has moved on.
+   */
+  private connectionError(message: string, deliveryUncertain = false): CommunicationError {
+    return new CommunicationError(message, {
+      connectionLevel: true,
+      deliveryUncertain,
+      withinGracePeriod: this.isWithinGracePeriod,
     });
   }
 
@@ -280,6 +401,8 @@ export class CommandClient {
         // getdevices failure is non-fatal; the connection handling will retry.
         this.dispatchNext();
       },
+      written: false,
+      holdTimer: null,
     };
     this.transmit(entry);
   }
@@ -296,8 +419,21 @@ export class CommandClient {
   }
 
   private transmit(entry: QueueEntry): void {
+    // A command that has already reached a socket is never written again. For a
+    // relay engage that would be a second physical press of the opener button.
+    if (entry.written) {
+      this.log.error(
+        `Refusing to re-send command "${truncate(entry.command, 256)}" to ${this.host}:${this.port}: ` +
+        'it has already been written to a socket and may have reached the device',
+      );
+      entry.reject(this.connectionError('Command already sent; not re-sent', true));
+      return;
+    }
+
+    this.clearHold(entry);
+
     if (this.socket === null || !this._isConnected) {
-      entry.reject(new CommunicationError('Not connected'));
+      entry.reject(this.connectionError('Not connected'));
       return;
     }
 
@@ -312,9 +448,12 @@ export class CommandClient {
       this._isConnected = false;
       this._connectionLostAt = Date.now();
       if (failed) {
-        failed.reject(new CommunicationError('Command timed out'));
+        // Written, then silence: delivery cannot be determined.
+        failed.reject(this.connectionError('Command timed out', failed.written));
       }
-      this.flushQueue(new CommunicationError('Communication failure after timeout'));
+      // Requirement 3.5 requires the queue to be discarded after a command
+      // timeout, so these are not held.
+      this.flushQueue(this.connectionError('Communication failure after timeout'));
       this.scheduleReconnect();
     }, COMMAND_TIMEOUT_MS);
     if (this.commandTimer.unref) {
@@ -322,6 +461,9 @@ export class CommandClient {
     }
 
     this.log.debug(`→ ${this.host}:${this.port}: ${truncate(entry.command, 256)}`);
+    // Mark before the write, not after: if write() throws, the bytes may still
+    // have gone out, and the entry must never be eligible for a second send.
+    entry.written = true;
     this.socket.write(entry.command + '\r');
   }
 
@@ -399,19 +541,40 @@ export class CommandClient {
       this._connectionLostAt = Date.now();
     }
 
-    // Fail the in-flight command.
+    // Fail the in-flight command. It had been written, so there is no way to
+    // know whether the IP2CC received and acted on it before the close. It is
+    // never re-sent; the two cases are logged distinctly so the next occurrence
+    // in production can be told apart from a command that never left.
     if (this.inFlight !== null) {
       const entry = this.inFlight;
       this.inFlight = null;
-      entry.reject(new CommunicationError('Connection closed'));
+      this.clearHold(entry);
+      if (entry.written) {
+        this.log.error(
+          `Command "${truncate(entry.command, 256)}" to ${this.host}:${this.port} was sent but the ` +
+          'connection closed before a reply; delivery to the device is unknown, so it will not be re-sent',
+        );
+      }
+      entry.reject(this.connectionError('Connection closed', entry.written));
     }
 
     if (this.shuttingDown) {
       return;
     }
 
-    // Flush the queue and schedule a reconnect.
-    this.flushQueue(new CommunicationError('Connection closed'));
+    // Commands still in the queue were never written to any socket, so sending
+    // one after the reconnect is its first and only send, not a retry. Hold
+    // them for the reconnect instead of burning the user's request.
+    if (this.queue.length > 0) {
+      this.log.warn(
+        `Connection to ${this.host}:${this.port} closed with ${this.queue.length} command(s) not yet ` +
+        `sent; holding them across the reconnect for up to ${RECONNECT_HOLD_MS}ms`,
+      );
+      for (const entry of this.queue) {
+        this.armHold(entry);
+      }
+    }
+
     this.scheduleReconnect();
   }
 
@@ -437,6 +600,7 @@ export class CommandClient {
   private flushQueue(error: Error): void {
     while (this.queue.length > 0) {
       const entry = this.queue.shift()!;
+      this.clearHold(entry);
       entry.reject(error);
     }
   }

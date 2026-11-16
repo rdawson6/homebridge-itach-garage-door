@@ -6,7 +6,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { CommandClient, CommunicationError, MAX_QUEUE_DEPTH, type SocketLike } from '../src/command-client.js';
+import {
+  CommandClient,
+  CommunicationError,
+  GRACE_PERIOD_MS,
+  isTransientConnectionFailure,
+  MAX_QUEUE_DEPTH,
+  RECONNECT_HOLD_MS,
+  type SocketLike,
+} from '../src/command-client.js';
 import { ProtocolCodec } from '../src/protocol-codec.js';
 import type { Logger } from '../src/logger.js';
 
@@ -210,9 +218,11 @@ describe('CommandClient', () => {
       // The 17th should reject immediately
       await expect(client.sendCommand('getstate,1:1')).rejects.toBeInstanceOf(CommunicationError);
 
-      // Clean up: connect and let them resolve/fail
+      // Clean up: connect, drop, and let the hold on the 16 held commands
+      // expire so they settle rather than waiting forever.
       currentSocket().emitConnect();
       currentSocket().emitClose();
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
       await Promise.allSettled(promises);
     });
   });
@@ -401,6 +411,223 @@ describe('CommandClient', () => {
       const countAfterDisconnect = sockets.length;
       vi.advanceTimersByTime(60_000);
       expect(sockets.length).toBe(countAfterDisconnect);
+    });
+  });
+
+  // ─── Held commands across a reconnect ──────────────────────────────────
+
+  /**
+   * The IP2CC at 192.168.4.235 drops its TCP session periodically and the
+   * client is back in about a second. A command submitted inside that window
+   * used to be failed outright, which burned the user's tap. These tests cover
+   * the hold, and — more importantly — the rule that no command is ever written
+   * to a socket twice, because a second `setstate <relay>,1` is a second
+   * physical press of a wired garage door or gate opener.
+   */
+  describe('held commands across a reconnect', () => {
+    /** Everything written to every socket this client ever created. */
+    function allWrites(): string[] {
+      return sockets.flatMap((s) => s.writes);
+    }
+
+    function writeCount(data: string): number {
+      return allWrites().filter((w) => w === data).length;
+    }
+
+    /** Connect, answer getdevices, then have the device drop the session. */
+    function connectThenDrop(client: CommandClient): void {
+      void client.connect();
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+      currentSocket().emitClose();
+    }
+
+    it('holds an unsent command across a reconnect and writes it exactly once', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(client);
+      expect(client.isConnected).toBe(false);
+
+      // A tap lands inside the reconnect window.
+      const promise = client.sendCommand('setstate,1:1,1');
+
+      // The immediate connect attempt is refused, as it plausibly was in
+      // production: the device had only just dropped a session.
+      currentSocket().emitClose();
+      expect(writeCount('setstate,1:1,1\r')).toBe(0);
+
+      // The reconnect scheduled 1s after the drop succeeds.
+      await vi.advanceTimersByTimeAsync(1000);
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+
+      expect(writeCount('setstate,1:1,1\r')).toBe(1);
+      currentSocket().emitData('setstate,1:1,1\r');
+      const response = await promise;
+      expect(response.type).toBe('setstate-echo');
+
+      // And it stays at one write, however long we wait.
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+      expect(writeCount('setstate,1:1,1\r')).toBe(1);
+      await client.disconnect();
+    });
+
+    it('sends getdevices before a held command on the new connection', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(client);
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      const reconnected = currentSocket();
+      reconnected.emitConnect();
+      expect(reconnected.writes[0]).toBe('getdevices\r');
+      reconnected.emitData('device,1,3 RELAY\rendlistdevices\r');
+      expect(reconnected.writes[1]).toBe('setstate,1:1,1\r');
+
+      await client.disconnect();
+      await promise;
+    });
+
+    it('fails a held command that no connection arrives for, without ever writing it', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(client);
+
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitClose();
+
+      // Every reconnect attempt stays unanswered until the hold expires.
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+
+      const err = await promise;
+      expect(err).toBeInstanceOf(CommunicationError);
+      expect((err as CommunicationError).connectionLevel).toBe(true);
+      expect((err as CommunicationError).deliveryUncertain).toBe(false);
+      expect(writeCount('setstate,1:1,1\r')).toBe(0);
+      await client.disconnect();
+    });
+
+    it('does not extend the hold when a later close re-examines the queue', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(client);
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+
+      // A second failed attempt part-way through the hold must not restart it.
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS - 500);
+      currentSocket().emitClose();
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(await promise).toBeInstanceOf(CommunicationError);
+      await client.disconnect();
+    });
+
+    it('reports a written command whose connection closed as delivery-uncertain, and never re-sends it', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+      expect(writeCount('setstate,1:1,1\r')).toBe(1);
+
+      // The session dies before the device echoes the command.
+      currentSocket().emitClose();
+
+      const err = await promise;
+      expect(err).toBeInstanceOf(CommunicationError);
+      expect((err as CommunicationError).connectionLevel).toBe(true);
+      expect((err as CommunicationError).deliveryUncertain).toBe(true);
+
+      // Reconnect and wait out any hold: still exactly one write.
+      await vi.advanceTimersByTimeAsync(1000);
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+      expect(writeCount('setstate,1:1,1\r')).toBe(1);
+      await client.disconnect();
+    });
+
+    it('logs the written and the unsent cases distinctly', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      const inFlight = client.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+      const queued = client.sendCommand('setstate,1:2,1').catch((e) => e);
+
+      currentSocket().emitClose();
+      await inFlight;
+
+      const errors = (log.error as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(errors.some((m) => m.includes('delivery to the device is unknown'))).toBe(true);
+      const warns = (log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(warns.some((m) => m.includes('1 command(s) not yet sent'))).toBe(true);
+
+      await client.disconnect();
+      await queued;
+    });
+
+    it('marks a fresh drop as transient and a client that never connected as persistent', async () => {
+      const dropped = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(dropped);
+      const transient = dropped.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitClose();
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+      expect(isTransientConnectionFailure(await transient)).toBe(true);
+      await dropped.disconnect();
+
+      // An IP2CC that has never answered is not a transient fault.
+      const absent = new CommandClient('10.0.0.9', 4998, codec, log, factory);
+      const persistent = absent.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitClose();
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+      const err = await persistent;
+      expect((err as CommunicationError).connectionLevel).toBe(true);
+      expect(isTransientConnectionFailure(err)).toBe(false);
+      await absent.disconnect();
+    });
+
+    it('marks a failure past the grace period as persistent', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      connectThenDrop(client);
+
+      // The outage outlasts the 30s grace period.
+      await vi.advanceTimersByTimeAsync(GRACE_PERIOD_MS);
+      expect(client.isWithinGracePeriod).toBe(false);
+
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+      await vi.advanceTimersByTimeAsync(RECONNECT_HOLD_MS);
+      const err = await promise;
+      expect((err as CommunicationError).connectionLevel).toBe(true);
+      expect((err as CommunicationError).withinGracePeriod).toBe(false);
+      expect(isTransientConnectionFailure(err)).toBe(false);
+      await client.disconnect();
+    });
+
+    it('does not treat a device error response as a connection failure', () => {
+      const deviceError = new CommunicationError('Relay engage failed');
+      expect(deviceError.connectionLevel).toBe(false);
+      expect(isTransientConnectionFailure(deviceError)).toBe(false);
+      expect(isTransientConnectionFailure(new Error('boom'))).toBe(false);
+      expect(isTransientConnectionFailure(undefined)).toBe(false);
+    });
+
+    it('marks a command timed out after being written as delivery-uncertain', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+      currentSocket().emitConnect();
+      currentSocket().emitData('device,1,3 RELAY\rendlistdevices\r');
+
+      vi.advanceTimersByTime(3000);
+      const err = await promise;
+      expect((err as CommunicationError).connectionLevel).toBe(true);
+      expect((err as CommunicationError).deliveryUncertain).toBe(true);
+      expect(writeCount('setstate,1:1,1\r')).toBe(1);
+      await client.disconnect();
+    });
+
+    it('leaves no hold timer behind after disconnect', async () => {
+      const client = new CommandClient('192.168.4.235', 4998, codec, log, factory);
+      const promise = client.sendCommand('setstate,1:1,1').catch((e) => e);
+
+      await client.disconnect();
+      expect(await promise).toBeInstanceOf(CommunicationError);
+      expect(vi.getTimerCount()).toBe(0);
     });
   });
 });

@@ -163,6 +163,103 @@ describe('PulseActuator', () => {
     });
   });
 
+  // ─── Connection drop during the engage ────────────────────────────────────
+
+  /**
+   * The relays are wired to a live garage door and live gates, so a failed
+   * engage must never produce a second engage. The actuator adds no retry of
+   * its own; these tests pin that down for every flag combination the client
+   * can report, and check the log says which case it was.
+   */
+  describe('connection failure during the engage', () => {
+    const cases: Array<{ label: string; error: CommunicationError; expectLog: string }> = [
+      {
+        label: 'never sent',
+        error: new CommunicationError('Connection unavailable; command never sent', {
+          connectionLevel: true,
+          withinGracePeriod: true,
+        }),
+        expectLog: 'never sent',
+      },
+      {
+        label: 'written, no reply',
+        error: new CommunicationError('Connection closed', {
+          connectionLevel: true,
+          deliveryUncertain: true,
+          withinGracePeriod: true,
+        }),
+        expectLog: 'may already have reached the device',
+      },
+      {
+        label: 'persistent outage',
+        error: new CommunicationError('Not connected', { connectionLevel: true }),
+        expectLog: 'never sent',
+      },
+      {
+        label: 'device error response',
+        error: new CommunicationError('Relay engage failed'),
+        expectLog: 'never sent',
+      },
+    ];
+
+    for (const { label, error, expectLog } of cases) {
+      it(`sends one engage, no release and no second engage (${label})`, async () => {
+        const client = new MockClient();
+        const log = makeLogger();
+        client.responder = (cmd) => {
+          if (cmd === 'setstate,1:1,1') {
+            throw error;
+          }
+          return { type: 'setstate-echo', module: 1, connector: 1, value: 0, raw: cmd };
+        };
+        const actuator = new PulseActuator(
+          client as unknown as CommandClient,
+          new ProtocolCodec(),
+          log,
+          '1:1',
+          500,
+        );
+
+        const rejection = await actuator.actuate('OPEN').catch((e: unknown) => e);
+        expect(rejection).toBe(error);
+
+        // Let every timer in the system run out.
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(client.sent).toEqual(['setstate,1:1,1']);
+
+        const errors = (log.error as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+        expect(errors.some((m) => m.includes(expectLog))).toBe(true);
+      });
+    }
+
+    it('completes with exactly one engage and one release when the engage resolves late', async () => {
+      // Simulates the client holding the engage across a reconnect: the
+      // command resolves ~1.1s after it was submitted.
+      const client = new MockClient();
+      client.responder = (cmd) => {
+        if (cmd === 'setstate,1:1,1') {
+          return new Promise<Response>((resolve) => {
+            setTimeout(
+              () => resolve({ type: 'setstate-echo', module: 1, connector: 1, value: 1, raw: cmd }),
+              1100,
+            );
+          });
+        }
+        return { type: 'setstate-echo', module: 1, connector: 1, value: 0, raw: cmd };
+      };
+      const actuator = makeActuator(client, 500);
+      const promise = actuator.actuate('OPEN');
+
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(client.sent).toEqual(['setstate,1:1,1']);
+
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await promise;
+      expect(result.target).toBe('OPEN');
+      expect(client.sent).toEqual(['setstate,1:1,1', 'setstate,1:1,0']);
+    });
+  });
+
   // ─── Relay release retry ──────────────────────────────────────────────────
 
   describe('relay release retry', () => {

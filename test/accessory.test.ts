@@ -147,6 +147,27 @@ class MockActuator {
   }
 }
 
+// ─── Injected timer ──────────────────────────────────────────────────────────
+
+/**
+ * Captures the deferred re-assert the accessory schedules after a transient
+ * failure, so tests can observe the state before and after it runs. hap-nodejs
+ * assigns the written value after awaiting the set handler, which is why that
+ * second re-assert exists.
+ */
+let deferred: Array<() => void> = [];
+
+const captureTimer = ((callback: () => void) => {
+  deferred.push(callback);
+  return 0 as unknown as ReturnType<typeof setTimeout>;
+}) as unknown as typeof setTimeout;
+
+function runDeferred(): void {
+  const pending = deferred;
+  deferred = [];
+  pending.forEach((cb) => cb());
+}
+
 // ─── Test harness ────────────────────────────────────────────────────────────
 
 const CONFIG: ValidatedDoorEntry = {
@@ -171,6 +192,7 @@ describe('GarageDoorAccessory', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    deferred = [];
     hap = makeHap();
     accessory = new MockAccessory();
     sm = new DoorStateMachine({ openingTime: 15, closingTime: 15, midTravelBehaviour: 'stop' });
@@ -194,6 +216,7 @@ describe('GarageDoorAccessory', () => {
       actuator as unknown as PulseActuator,
       persistence,
       log,
+      captureTimer,
     );
   }
 
@@ -257,6 +280,159 @@ describe('GarageDoorAccessory', () => {
       await expect(acc.handleTargetDoorStateSet(0)).rejects.toBeInstanceOf(HapStatusErrorMock);
       // State machine reverted (pulseFailed preserves prior state)
       expect(sm.state).toBe('CLOSED');
+    });
+  });
+
+  // ─── Transient connection failure ────────────────────────────────────────
+
+  /**
+   * The IP2CC drops its session periodically and the client is back in about a
+   * second. Reporting a communication failure for a fault that short latched
+   * the gates at "No Response" for 24 minutes in production, purely because
+   * nothing touched them afterwards. Requirements 5.11, 5.12.
+   */
+  describe('transient connection failure', () => {
+    const transient = (message: string, deliveryUncertain = false) =>
+      new CommunicationError(message, {
+        connectionLevel: true,
+        deliveryUncertain,
+        withinGracePeriod: true,
+      });
+
+    it('completes the write without error and leaves the door state unchanged', async () => {
+      actuator.behaviour = () => Promise.reject(transient('Connection closed'));
+      const acc = build();
+      await expect(acc.handleTargetDoorStateSet(0)).resolves.toBeUndefined();
+      expect(sm.state).toBe('CLOSED');
+    });
+
+    it('logs a warning naming the door, the state, the direction and the reason', async () => {
+      actuator.behaviour = () => Promise.reject(transient('Connection closed'));
+      const acc = build();
+      await acc.handleTargetDoorStateSet(0);
+
+      const warnings = (log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      const message = warnings.find((m) => m.includes('connection dropped')) ?? '';
+      expect(message).toContain('Garage');
+      expect(message).toContain('CLOSED');
+      expect(message).toContain('opened');
+      expect(message).toContain('Connection closed');
+      expect(message).toContain('the command was never sent, so the door was not moved');
+    });
+
+    it('says the door may have moved when delivery is uncertain', async () => {
+      actuator.behaviour = () => Promise.reject(transient('Connection closed', true));
+      const acc = build();
+      await acc.handleTargetDoorStateSet(0);
+
+      const warnings = (log.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(
+        warnings.some((m) => m.includes('may already have reached the IP2CC')),
+      ).toBe(true);
+    });
+
+    it('re-asserts both characteristics immediately and again one macrotask later', async () => {
+      actuator.behaviour = () => Promise.reject(transient('Connection closed'));
+      const acc = build();
+      const svc = gdoService();
+      const before = svc.updates.length;
+
+      await acc.handleTargetDoorStateSet(0);
+
+      const immediate = svc.updates.slice(before);
+      expect(immediate.filter((u) => u.ref === REF.CurrentDoorState).pop()?.value).toBe(1); // CLOSED
+      expect(immediate.filter((u) => u.ref === REF.TargetDoorState).pop()?.value).toBe(1); // CLOSED
+
+      // hap-nodejs would have assigned the written value (OPEN) by now; the
+      // deferred pass puts the real situation back.
+      const beforeDeferred = svc.updates.length;
+      runDeferred();
+      const later = svc.updates.slice(beforeDeferred);
+      expect(later.filter((u) => u.ref === REF.CurrentDoorState).pop()?.value).toBe(1);
+      expect(later.filter((u) => u.ref === REF.TargetDoorState).pop()?.value).toBe(1);
+    });
+
+    it('still throws when the connection loss is past the grace period', async () => {
+      actuator.behaviour = () =>
+        Promise.reject(new CommunicationError('Connection closed', { connectionLevel: true }));
+      const acc = build();
+      await expect(acc.handleTargetDoorStateSet(0)).rejects.toBeInstanceOf(HapStatusErrorMock);
+      expect(sm.state).toBe('CLOSED');
+    });
+
+    it('still throws for a device error response', async () => {
+      actuator.behaviour = () => Promise.reject(new CommunicationError('Relay engage failed'));
+      const acc = build();
+      await expect(acc.handleTargetDoorStateSet(0)).rejects.toBeInstanceOf(HapStatusErrorMock);
+    });
+
+    it('still throws when the relay is locked out after a failed release', async () => {
+      actuator.behaviour = () =>
+        Promise.reject(new CommunicationError('Relay release failed; door locked out'));
+      const acc = build();
+      await expect(acc.handleTargetDoorStateSet(0)).rejects.toBeInstanceOf(HapStatusErrorMock);
+    });
+
+    it('still throws when the actuation queue is full', async () => {
+      actuator.behaviour = () => Promise.reject(new CommunicationError('Actuation queue full'));
+      const acc = build();
+      await expect(acc.handleTargetDoorStateSet(0)).rejects.toBeInstanceOf(HapStatusErrorMock);
+    });
+  });
+
+  // ─── TargetDoorState get ─────────────────────────────────────────────────
+
+  /**
+   * Without a read handler, the HapStatusError reported to a write stays on the
+   * characteristic and hap-nodejs throws that stale code for every later read,
+   * which is what latched the tile at "No Response". Requirement 6.12.
+   */
+  describe('handleTargetDoorStateGet', () => {
+    it('is registered as a read handler', () => {
+      build();
+      expect(gdoService().characteristics.get(REF.TargetDoorState)?.getHandler).not.toBeNull();
+    });
+
+    it('returns the last value published by the plugin', async () => {
+      const acc = build();
+      expect(acc.handleTargetDoorStateGet()).toBe(1); // CLOSED
+      await acc.handleTargetDoorStateSet(0); // open
+      expect(sm.state).toBe('OPENING');
+      expect(acc.handleTargetDoorStateGet()).toBe(0); // OPEN
+    });
+
+    it('returns the last published value, not the written one, after a failed write', async () => {
+      const acc = build();
+      await acc.handleTargetDoorStateSet(0); // opens; publishes OPEN
+      actuator.behaviour = () => Promise.reject(new CommunicationError('Relay engage failed'));
+      await expect(acc.handleTargetDoorStateSet(1)).rejects.toBeInstanceOf(HapStatusErrorMock);
+      // hap-nodejs discards a written value when the handler throws.
+      expect(acc.handleTargetDoorStateGet()).toBe(0);
+    });
+
+    it('returns the unchanged state after a transient failure', async () => {
+      actuator.behaviour = () =>
+        Promise.reject(
+          new CommunicationError('Connection closed', {
+            connectionLevel: true,
+            withinGracePeriod: true,
+          }),
+        );
+      const acc = build();
+      await acc.handleTargetDoorStateSet(0);
+      expect(acc.handleTargetDoorStateGet()).toBe(1); // still CLOSED
+    });
+
+    it('returns the value most recently written by HomeKit while STOPPED', async () => {
+      const acc = build();
+      await acc.handleTargetDoorStateSet(0); // CLOSED → OPENING
+      // A second press stops a stop-mode door mid-travel.
+      await acc.handleTargetDoorStateSet(1);
+      expect(sm.state).toBe('STOPPED');
+      // Requirement 7.7: nothing is published for TargetDoorState while
+      // STOPPED, so the last HomeKit write stands.
+      expect(acc.handleTargetDoorStateGet()).toBe(1);
+      sm.cancelTimer();
     });
   });
 
@@ -412,6 +588,7 @@ describe('GarageDoorAccessory — one-push door', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    deferred = [];
     hap = makeHap();
     accessory = new MockAccessory();
     sm = new DoorStateMachine({ openingTime: 15, closingTime: 15, midTravelBehaviour: 'one-push' });
@@ -434,6 +611,7 @@ describe('GarageDoorAccessory — one-push door', () => {
       actuator as unknown as PulseActuator,
       persistence,
       log,
+      captureTimer,
     );
   }
 

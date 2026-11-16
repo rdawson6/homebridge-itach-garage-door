@@ -30,6 +30,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such as after a restart) instead of Stopped. Internally, in the log and on
   disk the state is still `STOPPED`. Doors on `stop` or `reverse` are
   unaffected and still present Stopped, and `stop` remains the default.
+- A HomeKit open or close write is now completed without an error when the
+  IP2CC connection drops and is re-established inside the 30-second grace
+  period. The door does not move, a warning names the door, its unchanged
+  state, the requested direction and the reason, and the tile settles back,
+  rather than the accessory latching "No Response". A device error response, a
+  relay-release lockout, a full actuation queue, and an outage that has reached
+  30 seconds all still report a communication failure to HomeKit.
+- Spec amended accordingly, since the previous wording mandated a communication
+  failure for every failed relay-engage command: Requirement 3.14–3.16 (holding
+  an unsent command across a reconnect, write-once, and labelling a failure
+  transient or persistent), 5.4–5.6 (narrowed to a device error response, with
+  the state-0 retry policy explicitly covering connection failures too),
+  5.11–5.13 (the transient and persistent pulse outcomes, and the rule that a
+  relay engage is sent at most once), 6.11 and 6.12 (the `TargetDoorState` read
+  handler), and 7.8. The spec is not part of this package, so this entry is its
+  only record here.
+
+### Fixed
+
+- The accessory category persisted as OTHER instead of GARAGE_DOOR_OPENER.
+  Homebridge keeps the category twice: `accessory.category` is a mirror field,
+  while the value written to `cachedAccessories` comes from the wrapped
+  hap-nodejs accessory, which the plugin never set. Both are now set, and an
+  accessory already cached with the wrong category is corrected on the next
+  Homebridge restart.
+- A relay command submitted while the IP2CC connection was down failed
+  immediately, which burned the tap. The command client now holds a command
+  that has not yet been written to a socket for up to 2 seconds across the
+  reconnect and sends it once on the new connection. A command that *had* been
+  written when the connection closed is never sent again, because whether it
+  reached the device cannot be determined and a second relay engage would be a
+  second press of the opener button; the log now distinguishes the two cases.
+- `TargetDoorState` had no read handler, so a communication failure reported to
+  a write stayed on the characteristic and every later read of it failed. An
+  accessory could show "No Response" indefinitely until the user next operated
+  it.
 
 ## [1.0.1] — 2026-11-11
 

@@ -30,6 +30,24 @@ import type { ValidatedDoorEntry } from './types.js';
 export const PLUGIN_IDENTIFIER = 'homebridge-itach-garage-door';
 export const PLATFORM_NAME = 'ItachGarageDoor';
 
+/**
+ * Stamp the GARAGE_DOOR_OPENER category onto an accessory so it reaches disk.
+ *
+ * Homebridge keeps the category twice. `accessory.category` is a plain mirror
+ * field, but `PlatformAccessory.serialize()` — the only thing that writes the
+ * cached-accessories file — reads the category from the wrapped hap-nodejs
+ * accessory at `_associatedHAPAccessory`. Assigning the mirror alone leaves the
+ * wrapped accessory at hap-nodejs's default of OTHER (1), which is exactly what
+ * the live cache showed. Both are set here; the wrapped accessory is optional
+ * because test doubles need not model it (Requirement 1.3).
+ */
+export function applyGarageDoorCategory(accessory: PlatformAccessoryLike): void {
+  accessory.category = CATEGORY_GARAGE_DOOR_OPENER;
+  if (accessory._associatedHAPAccessory !== undefined) {
+    accessory._associatedHAPAccessory.category = CATEGORY_GARAGE_DOOR_OPENER;
+  }
+}
+
 /** Runtime state tracked per configured door. */
 export interface DoorRuntime {
   config: ValidatedDoorEntry;
@@ -249,13 +267,17 @@ export class ItachGarageDoorPlatform {
     const cached = this.cachedAccessories.find((a) => a.UUID === uuid);
     if (cached !== undefined) {
       cached.displayName = door.name;
-      (cached as unknown as { category: number }).category = CATEGORY_GARAGE_DOOR_OPENER;
+      // Repair the category before the update is saved: an accessory cached by
+      // an earlier version carries OTHER (1) and must be corrected on disk.
+      applyGarageDoorCategory(cached);
       this.api.updatePlatformAccessories([cached]);
       return cached;
     }
 
-    const accessory = new this.api.platformAccessory(door.name, uuid);
-    accessory.category = CATEGORY_GARAGE_DOOR_OPENER;
+    // The category is passed to the constructor as well as assigned, so the
+    // wrapped HAP accessory carries it from the outset.
+    const accessory = new this.api.platformAccessory(door.name, uuid, CATEGORY_GARAGE_DOOR_OPENER);
+    applyGarageDoorCategory(accessory);
     this.api.registerPlatformAccessories(PLUGIN_IDENTIFIER, PLATFORM_NAME, [accessory]);
     return accessory;
   }

@@ -31,10 +31,25 @@ export interface ServiceLike {
   updateCharacteristic(characteristic: CharacteristicRef, value: CharacteristicValue): ServiceLike;
 }
 
+/**
+ * The hap-nodejs `Accessory` wrapped inside a Homebridge PlatformAccessory.
+ *
+ * Homebridge's `PlatformAccessory.serialize()` reads the category from this
+ * wrapped object, not from the PlatformAccessory's own mirror field, so this is
+ * the copy that reaches the cached-accessories file on disk.
+ */
+export interface WrappedHapAccessory {
+  category: number;
+}
+
 /** A PlatformAccessory as used by the handler. */
 export interface PlatformAccessoryLike {
   readonly UUID: string;
   displayName: string;
+  /** Mirror of the accessory category; not the value Homebridge persists. */
+  category?: number;
+  /** The wrapped hap-nodejs accessory, whose category is the persisted one. */
+  _associatedHAPAccessory?: WrappedHapAccessory;
   getService(service: ServiceRef): ServiceLike | undefined;
   addService(service: ServiceRef, ...args: unknown[]): ServiceLike;
 }
@@ -88,7 +103,7 @@ export interface PlatformAccessoryConstructable extends PlatformAccessoryLike {
 }
 
 export interface PlatformAccessoryConstructor {
-  new (displayName: string, uuid: string): PlatformAccessoryConstructable;
+  new (displayName: string, uuid: string, category?: number): PlatformAccessoryConstructable;
 }
 
 /** Minimal HAP uuid helper. */

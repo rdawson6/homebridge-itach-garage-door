@@ -24,6 +24,7 @@ import type {
   ValidatedDoorEntry,
 } from './types.js';
 import type { DoorStateMachine } from './door-state-machine.js';
+import { CommunicationError, isTransientConnectionFailure } from './command-client.js';
 import type { PulseActuator } from './pulse-actuator.js';
 import type { WebhookDoorHandler } from './webhook-listener.js';
 import type { Logger } from './logger.js';
@@ -100,7 +101,16 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
   private readonly persistKey: string;
 
   private readonly service: ServiceLike;
+  private readonly setTimer: typeof setTimeout;
   private obstructionDetected = false;
+
+  /**
+   * The TargetDoorState value most recently published by the plugin or written
+   * by HomeKit, whichever was later. Initialised to OPEN (0) to match
+   * hap-nodejs's default for the characteristic, so a read before anything has
+   * been published returns what it returns today.
+   */
+  private lastTargetDoorState = 0;
 
   constructor(
     api: HapApiContainer,
@@ -110,6 +120,7 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
     actuator: PulseActuator,
     persistence: PersistenceStore,
     log: Logger,
+    setTimer: typeof setTimeout = setTimeout,
   ) {
     this.api = api;
     this.accessory = accessory;
@@ -118,6 +129,7 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
     this.actuator = actuator;
     this.persistence = persistence;
     this.log = log;
+    this.setTimer = setTimer;
     this.persistKey = persistenceKey(config.ipAddress, config.relay);
 
     const { Service, Characteristic } = this.api.hap;
@@ -141,7 +153,8 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
     // Characteristic handlers
     this.service
       .getCharacteristic(Characteristic.TargetDoorState)
-      .onSet((value) => this.handleTargetDoorStateSet(value));
+      .onSet((value) => this.handleTargetDoorStateSet(value))
+      .onGet(() => this.handleTargetDoorStateGet());
 
     this.service
       .getCharacteristic(Characteristic.CurrentDoorState)
@@ -183,6 +196,15 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
    */
   async handleTargetDoorStateSet(value: CharacteristicValue): Promise<void> {
     const wantsOpen = value === 0; // TargetDoorState.OPEN === 0
+
+    // hap-nodejs accepts the written value unless this handler throws, so
+    // record it now; anything the plugin publishes below happens later and
+    // therefore takes precedence (Requirement 6.12). The previous value is kept
+    // so a throwing path can put it back, matching hap-nodejs discarding the
+    // write. While the door is STOPPED nothing is published for this
+    // characteristic, so this is the value HomeKit reads (Requirement 7.7).
+    const previousTargetDoorState = this.lastTargetDoorState;
+    this.lastTargetDoorState = wantsOpen ? 0 : 1;
 
     const action = wantsOpen ? this.stateMachine.requestOpen() : this.stateMachine.requestClose();
     if (action === 'no-op') {
@@ -228,12 +250,52 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
     } catch (err) {
       this.stateMachine.pulseFailed();
       const message = err instanceof Error ? err.message : String(err);
+
+      if (isTransientConnectionFailure(err)) {
+        // The IP2CC drops its session periodically and is back in about a
+        // second. Reporting a communication failure for a fault that short
+        // latches the tile at "No Response" in the Home app until the user next
+        // interacts with it, which is worse than a door that did not move.
+        // Requirement 5.11.
+        const delivery =
+          err instanceof CommunicationError && err.deliveryUncertain
+            ? 'the command may already have reached the IP2CC, so the door may have started moving; ' +
+              'the reported state was left unchanged'
+            : 'the command was never sent, so the door was not moved';
+        this.log.warn(
+          `Door "${this.config.name}" (${this.stateMachine.state}) could not be ` +
+          `${wantsOpen ? 'opened' : 'closed'}: the IP2CC connection dropped ` +
+          `(${truncate(message, 512)}). ${delivery}. Press again.`,
+        );
+        this.reassertCharacteristics();
+        return;
+      }
+
       this.log.error(
         `Door "${this.config.name}" (${this.stateMachine.state}) pulse failed: ${truncate(message, 512)}`,
       );
+      // hap-nodejs discards the written value when the handler throws, so the
+      // characteristic reverts to whatever the plugin last published.
+      this.lastTargetDoorState = previousTargetDoorState;
       const { HapStatusError, HAPStatus } = this.api.hap;
       throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
     }
+  }
+
+  /**
+   * Re-publish the characteristics from the unchanged door state, twice.
+   *
+   * hap-nodejs assigns the written value to the characteristic *after* awaiting
+   * the set handler, so a re-assert made inside the handler is overwritten and
+   * the tile would sit at Target=Open / Current=Closed, showing "Opening…"
+   * forever. The second pass runs one macrotask later, which lands after that
+   * assignment.
+   */
+  private reassertCharacteristics(): void {
+    this.pushCharacteristics(this.stateMachine.state);
+    this.setTimer(() => {
+      this.pushCharacteristics(this.stateMachine.state);
+    }, 0);
   }
 
   handleCurrentDoorStateGet(): CharacteristicValue {
@@ -247,6 +309,18 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
         this.stateMachine.lastTravelDirection,
       ),
     );
+  }
+
+  /**
+   * HomeKit TargetDoorState read (Requirement 6.12).
+   *
+   * Without a read handler, a communication failure reported to a write stays
+   * on the characteristic as its status code and hap-nodejs throws that stale
+   * code for every later read, which is what latched the accessory at "No
+   * Response" for 24 minutes. A handler that always succeeds breaks the latch.
+   */
+  handleTargetDoorStateGet(): CharacteristicValue {
+    return this.lastTargetDoorState;
   }
 
   handleObstructionDetectedGet(): boolean {
@@ -279,7 +353,8 @@ export class GarageDoorAccessory implements WebhookDoorHandler {
     this.service.updateCharacteristic(Characteristic.CurrentDoorState, toCurrentDoorState(shown));
     // A presented STOPPED leaves TargetDoorState unchanged (Requirement 8.7).
     if (shown !== 'STOPPED') {
-      this.service.updateCharacteristic(Characteristic.TargetDoorState, toTargetDoorState(shown));
+      this.lastTargetDoorState = toTargetDoorState(shown);
+      this.service.updateCharacteristic(Characteristic.TargetDoorState, this.lastTargetDoorState);
     }
   }
 

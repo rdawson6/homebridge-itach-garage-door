@@ -289,6 +289,8 @@ Enable Homebridge debug logging (`homebridge -D`) to see every command sent and 
 
 **The tile says Opening or Closing but the door is not moving.** Expected on a `one-push` door that was interrupted mid-travel: the plugin holds the travel wording until the next press, a completed travel leg, a webhook correction, or a restart resolves it.
 
+**A tap did nothing and the log mentions the connection dropping.** Some IP2CC units drop their TCP session periodically; the plugin reconnects in about a second. A command that had not yet been sent is held for up to 2 seconds across that reconnect and then sent once, so most taps survive the drop. If no connection comes back in time the write is still completed without a HomeKit error — the door did not move, a warning names the door and the reason, and the tile settles back — so press again. Once the connection has been down for 30 seconds the plugin does report a communication failure, because at that point the door genuinely cannot be operated. The plugin never re-sends a relay engage command it has already written to a socket, since it cannot confirm whether the device acted on it and a second engage would be a second press of the opener button.
+
 ## Safety
 
 Read this section before putting the plugin into service.

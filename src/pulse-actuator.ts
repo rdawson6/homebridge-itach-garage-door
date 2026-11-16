@@ -174,7 +174,16 @@ export class PulseActuator {
       })
       .catch((err: unknown) => {
         const error = err instanceof Error ? err : new CommunicationError(String(err));
-        this.log.error(`Relay ${this.relayLabel} setstate 1 failed: ${error.message}; pulse abandoned`);
+        // Say which case it was. A command that never left is a clean miss; one
+        // that was written may already have pressed the button, and either way
+        // it is never sent again (no state-0 follows an abandoned pulse).
+        const delivery =
+          error instanceof CommunicationError && error.deliveryUncertain
+            ? 'the command may already have reached the device, so it will not be retried'
+            : 'the command was never sent';
+        this.log.error(
+          `Relay ${this.relayLabel} setstate 1 failed: ${error.message} (${delivery}); pulse abandoned`,
+        );
         this.finishPulseFailure(entry, error);
       });
   }

@@ -63,16 +63,31 @@ class MockService implements ServiceLike {
   updateCharacteristic(ref: unknown, v: CharacteristicValue): ServiceLike { this.ensure(ref).value = v; return this; }
 }
 
+/**
+ * Faithful to homebridge's PlatformAccessory shape, which is what let the
+ * category bug through: `category` is a plain mirror field, while the value
+ * that `serialize()` writes to the cached-accessories file comes from the
+ * wrapped hap-nodejs accessory. Both default to OTHER (1), as they do in
+ * homebridge and hap-nodejs.
+ */
 class MockAccessory implements PlatformAccessoryLike {
-  category = 0;
+  category = 1;
+  _associatedHAPAccessory = { category: 1 };
   services = new Map<unknown, MockService>();
-  constructor(public displayName: string, public UUID: string) {}
+  constructor(public displayName: string, public UUID: string, category?: number) {
+    if (category !== undefined) {
+      this.category = category;
+      this._associatedHAPAccessory.category = category;
+    }
+  }
   getService(ref: unknown): ServiceLike | undefined { return this.services.get(ref); }
   addService(ref: unknown): ServiceLike {
     const s = new MockService();
     this.services.set(ref, s);
     return s;
   }
+  /** What homebridge would persist for this accessory. */
+  serializedCategory(): number { return this._associatedHAPAccessory.category; }
 }
 
 class HapStatusErrorMock extends Error {
@@ -84,6 +99,12 @@ class MockApi {
   registered: PlatformAccessoryLike[] = [];
   unregistered: PlatformAccessoryLike[] = [];
   updated: PlatformAccessoryLike[] = [];
+  /**
+   * Categories as they stood when register/update was called — homebridge
+   * serialises to disk at those moments, so a later correction would not help.
+   */
+  registeredCategories: number[] = [];
+  updatedCategories: number[] = [];
   private handlers = new Map<string, Array<() => void>>();
 
   hap = {
@@ -122,12 +143,14 @@ class MockApi {
 
   registerPlatformAccessories(_p: string, _n: string, accs: PlatformAccessoryLike[]): void {
     this.registered.push(...accs);
+    this.registeredCategories.push(...accs.map((a) => (a as MockAccessory).serializedCategory()));
   }
   unregisterPlatformAccessories(_p: string, _n: string, accs: PlatformAccessoryLike[]): void {
     this.unregistered.push(...accs);
   }
   updatePlatformAccessories(accs: PlatformAccessoryLike[]): void {
     this.updated.push(...accs);
+    this.updatedCategories.push(...accs.map((a) => (a as MockAccessory).serializedCategory()));
   }
 }
 
@@ -230,6 +253,15 @@ describe('ItachGarageDoorPlatform', () => {
       expect((api.registered[0] as unknown as MockAccessory).category).toBe(4);
     });
 
+    it('sets the category on the wrapped HAP accessory, which is what is persisted', async () => {
+      const platform = build({ doors: [door()] });
+      await platform.discoverDevices();
+      const registered = api.registered[0] as unknown as MockAccessory;
+      expect(registered._associatedHAPAccessory.category).toBe(4);
+      // And it was already 4 when homebridge serialised it, not corrected later.
+      expect(api.registeredCategories).toEqual([4]);
+    });
+
     it('logs the door ID at info level on publish', async () => {
       const platform = build({ doors: [door()] });
       await platform.discoverDevices();
@@ -301,6 +333,22 @@ describe('ItachGarageDoorPlatform', () => {
       platform.configureAccessory(cached);
       await platform.discoverDevices();
       expect(api.unregistered).toHaveLength(0);
+    });
+
+    it('repairs a cached accessory stored with the wrong category before it is saved', async () => {
+      // This is the state the live cache was found in: category OTHER (1) on
+      // both fields, restored from disk by homebridge.
+      const cached = new MockAccessory('Garage', 'uuid-192.168.4.235:1:1');
+      expect(cached._associatedHAPAccessory.category).toBe(1);
+
+      const platform = build({ doors: [door()] });
+      platform.configureAccessory(cached);
+      await platform.discoverDevices();
+
+      expect(cached.category).toBe(4);
+      expect(cached._associatedHAPAccessory.category).toBe(4);
+      // Repaired before updatePlatformAccessories wrote the cache.
+      expect(api.updatedCategories).toEqual([4]);
     });
   });
 
