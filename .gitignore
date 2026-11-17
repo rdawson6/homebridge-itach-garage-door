@@ -19,3 +19,6 @@ coverage/
 # Logs
 *.log
 npm-debug.log*
+
+# Workflow agent scratch (plans, reviews, task artefacts)
+.agents/
