@@ -92,7 +92,7 @@ Worked example with explicit timing and a webhook:
         }
       ],
       "webhook": {
-        "port": 8581,
+        "port": 8999,
         "bindAddress": "0.0.0.0",
         "token": "b7f3c1d9e2a48f6b0c5d7e9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c"
       }
@@ -122,6 +122,13 @@ Worked example with explicit timing and a webhook:
 | `port` | integer | no | — | 1024–65535 | Listening port. Omit to disable the webhook entirely. |
 | `bindAddress` | string | no | `0.0.0.0` | dotted-quad IPv4 | Interface to bind. Use `127.0.0.1` for local-only access. |
 | `token` | string | yes if `port` set | — | 20–128 printable chars | Shared secret for the `X-Auth-Token` header. |
+
+**Choosing a webhook port.** The examples here use `8999`. Two things make a port a good choice:
+
+- **Avoid 8581.** That is the Homebridge UI's own default port, so using it would collide with the service you configure the plugin from.
+- **Stay below the ephemeral range.** On Linux the kernel hands out 32768–60999 for outgoing connections, so a listening port in that range can be taken by an unrelated outbound socket before Homebridge starts. A port below 32768 that nothing else on the host uses — 8999 here — cannot be stolen that way.
+
+Pick any free port that meets both conditions rather than copying one blindly; if the port is already in use the webhook fails to bind and the plugin logs the error.
 
 Out-of-range numeric values fall back to the default and are logged at error level; the rest of the door entry is preserved. A door with a missing or malformed required field is skipped, and the remaining doors still publish.
 
@@ -215,7 +222,7 @@ Body:
 Authenticated example:
 
 ```bash
-curl -X POST http://homebridge.local:8581/door/garage/state \
+curl -X POST http://homebridge.local:8999/door/garage/state \
   -H "X-Auth-Token: b7f3c1d9e2a48f6b0c5d7e9a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c" \
   -H "Content-Type: application/json" \
   -d '{"state":"open"}'
@@ -242,18 +249,29 @@ Checks run in that order and stop at the first failure, so a request with a bad 
 
 ### Home app automation pattern
 
-To keep the tile accurate using an Eve Door & Window sensor (or any HomeKit contact sensor) on the door:
+An Eve Door & Window sensor (or any HomeKit contact sensor) on a garage door or gate reports one thing definitively: **the door is closed**. The contact only makes when the door is in the fully shut position. A broken contact means *not closed*, which could be fully open, partly open, moving in either direction, or stopped part-way. Build the automations around that asymmetry rather than treating the sensor as an open/closed switch.
 
-1. Fit the contact sensor so it reads **closed** when the door is fully shut.
-2. In the Home app, create an automation: **When** the sensor *opens* → **Convert to Shortcut** → add **Get Contents of URL**.
+| Sensor event | Send | Why |
+|---|---|---|
+| Contact **makes** (door reaches the shut position) | `{"state":"closed"}` | Definitive. The sensor knows this and the timers may not. |
+| Contact **breaks** (door leaves the shut position) | `{"state":"opening"}` | True at that instant, and honest about not knowing the end position. |
+
+Set it up like this:
+
+1. Fit the contact sensor so it reads **closed** only when the door is fully shut.
+2. In the Home app, create an automation: **When** the sensor *closes* → **Convert to Shortcut** → add **Get Contents of URL**.
 3. Configure that action:
-   - URL: `http://homebridge.local:8581/door/garage/state`
+   - URL: `http://homebridge.local:8999/door/garage/state`
    - Method: `POST`
    - Headers: `X-Auth-Token` = your token, `Content-Type` = `application/json`
-   - Request Body: JSON, `state` = `open`
-4. Create the mirror automation for the sensor *closing*, sending `{"state":"closed"}`.
+   - Request Body: JSON, `state` = `closed`
+4. Create the mirror automation for the sensor *opening*, sending `{"state":"opening"}`.
 
-The sensor now corrects the plugin whenever the door is operated by any means, including a handheld remote.
+**Why `opening` and not `open`.** When the contact breaks the door has started to move but is nowhere near the other end of its travel. Sending `opening` is literally true at that moment, and it restarts the opening timer from when real movement began, so the tile reaches Open at roughly the time the door does rather than at the time a timer started from a HomeKit press. Sending `open` instead would claim a fully open door while it is still travelling — worse than the timer alone, and most obviously wrong when the door was opened from HomeKit and a travel timer is already running. Once the opening timer expires the state settles to `OPEN`, which is the plugin's way of saying "not closed" and is the honest reading of a broken contact.
+
+This gives the correction that matters most for safety: the plugin can no longer sit reporting the door shut when the sensor can see that it is not. It corrects the state whenever the door is operated by any means, including a handheld remote or by hand.
+
+**If the sensor goes quiet, nothing tells you.** The plugin never polls the sensor — the webhook is push-only — so a sensor with a flat battery, off the network, or with its automations disabled simply stops sending corrections. The plugin falls back to pure timer inference, exactly as if no webhook were configured. Nothing errors, nothing is logged, and the garage door tiles do **not** show "No Response"; only the sensor's own tile does. **This fails silently**, and a silently stale "Closed" is the state you least want to trust. Create a HomeKit automation on the sensor's low-battery condition (or check it on a schedule) so you find out before the corrections stop.
 
 ## How door state is determined
 

@@ -140,20 +140,33 @@
       "title": "Doors",
       "buttonText": "Add Door",
       "items": [
-        "doors[].name",
-        "doors[].ipAddress",
-        "doors[].relay",
         {
           "type": "fieldset",
-          "title": "Timing",
-          "expandable": true,
-          "items": ["doors[].pulseDuration", "doors[].openingTime", "doors[].closingTime", "doors[].midTravelBehaviour"]
-        },
-        {
-          "type": "fieldset",
-          "title": "Advanced",
-          "expandable": true,
-          "items": ["doors[].port", "doors[].doorId"]
+          "title": "Door",
+          "items": [
+            "doors[].name",
+            "doors[].ipAddress",
+            "doors[].relay",
+            {
+              "type": "fieldset",
+              "title": "Timing",
+              "expandable": true,
+              "expanded": false,
+              "items": [
+                "doors[].pulseDuration",
+                "doors[].openingTime",
+                "doors[].closingTime",
+                "doors[].midTravelBehaviour"
+              ]
+            },
+            {
+              "type": "fieldset",
+              "title": "Advanced",
+              "expandable": true,
+              "expanded": false,
+              "items": ["doors[].port", "doors[].doorId"]
+            }
+          ]
         }
       ]
     },

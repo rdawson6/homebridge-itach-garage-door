@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Homebridge UI settings form for the `doors` array. The `layout` block listed
+  five elements inside the array's `items`, which the UI's form renderer
+  (`@ng-formworks/core`) treats as five separate array entries: the Timing and
+  Advanced fieldsets rendered as rows with their own delete controls, the real
+  door fields were bound to the index after them, and configured doors did not
+  appear. Saving from that form would have written back a `doors` array that
+  was not the user's configuration. The per-entry layout is now a single
+  `fieldset` wrapper, the shape the renderer treats as the array-item
+  template, so each configured door renders once. The Timing and Advanced
+  groups are kept, nested inside the wrapper. Only `layout` changed; the
+  `schema` object is untouched.
+
+### Documentation
+
+- Webhook examples use port `8999` instead of `8581`, which is the Homebridge
+  UI's own port, and explain how to choose one: clear of 8581 and below
+  Linux's ephemeral range (32768–60999) so an outbound connection cannot take
+  it.
+- Rewrote the contact-sensor automation guidance. A reed sensor on a garage
+  door or gate definitively reports only *closed*; a broken contact means "not
+  closed", not "open". The closing event now sends `{"state":"closed"}` and
+  the opening event sends `{"state":"opening"}` rather than `"open"`, which is
+  true at the instant the contact breaks, resynchronises the travel timer to
+  real movement, and settles to `OPEN` when the timer expires instead of
+  prematurely claiming a fully open door.
+- Documented the dead-sensor failure mode: the plugin never polls the sensor
+  and the webhook is push-only, so an unresponsive sensor silently stops
+  corrections and the plugin reverts to timer inference. The door tiles do not
+  show "No Response". Suggests a low-battery notification automation.
+
 ## [1.1.0] — 2026-11-17
 
 ### Added
